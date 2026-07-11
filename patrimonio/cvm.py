@@ -188,6 +188,72 @@ def cota_mais_recente(cnpj: str) -> Optional[tuple[str, float]]:
     return None
 
 
+def cotas_para_cnpjs(
+    cnpjs: set[str], data_ref: str, meses_retro: int = 3
+) -> dict[str, tuple[str, float]]:
+    """Cota no pregão <= `data_ref` para um conjunto de CNPJs, em poucas passadas.
+
+    Lê o Informe Diário do mês da data e retrocede até `meses_retro` meses,
+    varrendo cada arquivo mensal uma única vez (eficiente para validar muitos
+    candidatos de uma vez). Retorna {cnpj_normalizado: (data_iso, cota)} apenas
+    para os CNPJs encontrados com pregão <= data_ref.
+    """
+    alvos = {_so_digitos(c) for c in cnpjs if c}
+    if not alvos:
+        return {}
+    limite = datetime.fromisoformat(data_ref).date()
+    melhor: dict[str, tuple[str, float]] = {}
+    pendentes = set(alvos)
+
+    base = limite
+    for recuo in range(0, meses_retro + 1):
+        if not pendentes:
+            break
+        ano = base.year
+        mes = base.month - recuo
+        while mes <= 0:
+            mes += 12
+            ano -= 1
+        aaaamm = f"{ano:04d}{mes:02d}"
+        try:
+            conteudo = _baixar_informe(aaaamm)
+        except ErroDadosCVM:
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+                for nome in (n for n in zf.namelist() if n.lower().endswith(".csv")):
+                    with zf.open(nome) as bruto:
+                        texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                        leitor = csv.DictReader(texto, delimiter=";")
+                        col_cnpj = next(
+                            (c for c in _COLS_CNPJ if c in (leitor.fieldnames or [])), None
+                        )
+                        if col_cnpj is None:
+                            continue
+                        for linha in leitor:
+                            cnpj = _so_digitos(linha.get(col_cnpj, ""))
+                            if cnpj not in alvos:
+                                continue
+                            data_str = (linha.get(_COL_DATA) or "").strip()
+                            cota_str = (linha.get(_COL_COTA) or "").strip()
+                            if not data_str or not cota_str:
+                                continue
+                            try:
+                                d = datetime.fromisoformat(data_str).date()
+                                cota = float(cota_str.replace(",", "."))
+                            except ValueError:
+                                continue
+                            if d > limite:
+                                continue
+                            atual = melhor.get(cnpj)
+                            if atual is None or data_str > atual[0]:
+                                melhor[cnpj] = (data_str, cota)
+        except zipfile.BadZipFile:
+            continue
+        pendentes = alvos - set(melhor)
+    return melhor
+
+
 def novo_valor_estimado(
     cnpj: str, data_snapshot: str, valor_snapshot: float
 ) -> Optional[dict]:

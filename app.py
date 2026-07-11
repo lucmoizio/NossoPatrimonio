@@ -1,4 +1,4 @@
-"""Robô Patrimônio — interface Streamlit (7 abas).
+"""Robô Patrimônio — interface Streamlit (8 abas).
 
 Uso pessoal. Local-first: os dados ficam em `patrimonio.db` na sua máquina.
 Indicadores e cotas vêm apenas de fontes oficiais (BCB, CVM); estimativas são
@@ -18,37 +18,18 @@ import streamlit as st
 
 from patrimonio import (
     analise,
+    cadastro_cvm,
     consultor,
     cvm,
     database,
+    importador_xp,
+    importador_xp_planilha,
     mercado,
     projecao,
     relatorios,
     simulador,
 )
-
-# --------------------------------------------------------------------------- #
-# Constantes de domínio
-# --------------------------------------------------------------------------- #
-CATEGORIAS = [
-    "Renda Fixa - Pós-fixado",
-    "Renda Fixa - Prefixado",
-    "Renda Fixa - Inflação",
-    "Crédito Privado",
-    "Fundo Multimercado",
-    "Fundo de Ações",
-    "Fundo Imobiliário",
-    "FIDC",
-    "COE",
-    "Ações",
-    "Tesouro Direto",
-    "LCI/LCA",
-    "CDB",
-    "Poupança",
-    "Outro",
-]
-
-LIQUIDEZ = ["D+0", "D+1", "D+2", "D+30", "D+90", "No vencimento", "Baixa", "Outra"]
+from patrimonio.dominio import CATEGORIAS, LIQUIDEZ
 
 
 # --------------------------------------------------------------------------- #
@@ -648,6 +629,201 @@ def aba_proventos_ir(titular_id: int | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Aba: Importar extrato
+# --------------------------------------------------------------------------- #
+def aba_importar() -> None:
+    st.header("📥 Importar extrato (XP)")
+    st.caption(
+        "Envie a **Posição Detalhada** (XLSX/CSV — recomendado, traz o valor "
+        "aplicado) ou o relatório de performance (PDF). O sistema lê os ativos, "
+        "resolve o CNPJ dos fundos pela CVM e grava após a sua conferência."
+    )
+
+    mapa = _mapa_titulares()
+    titulares_nomes = [n for n in mapa if n != "Consolidado"]
+
+    arquivo = st.file_uploader(
+        "Arquivo da XP (Posição Detalhada .xlsx/.csv ou XPerformance .pdf)",
+        type=["xlsx", "xls", "csv", "pdf"],
+    )
+    if arquivo is None:
+        st.info(
+            "Aguardando o envio. Dica: no app/site da XP, exporte a "
+            "'Posição Detalhada' em Excel — é o formato mais completo."
+        )
+        return
+
+    resolver = st.checkbox(
+        "Resolver CNPJ automaticamente pela CVM (requer internet)", value=True
+    )
+
+    chave = f"{arquivo.name}:{arquivo.size}:{resolver}"
+    estado = st.session_state.get("import_estado")
+    if estado is None or estado.get("chave") != chave:
+        nome_lower = arquivo.name.lower()
+        eh_pdf = nome_lower.endswith(".pdf")
+        try:
+            with st.spinner("Lendo o arquivo..."):
+                if eh_pdf:
+                    resultado = importador_xp.importar(arquivo.getvalue())
+                else:
+                    resultado = importador_xp_planilha.importar(
+                        arquivo.getvalue(), nome_arquivo=arquivo.name
+                    )
+        except importador_xp.ErroImportacaoXP as exc:
+            st.error(f"Não foi possível interpretar o arquivo: {exc}")
+            return
+
+        resolucoes = None
+        if resolver and resultado.metadados.data_referencia:
+            with st.spinner("Resolvendo CNPJs na CVM (cadastro + Informe Diário)..."):
+                try:
+                    resolucoes = cadastro_cvm.resolver_carteira(
+                        resultado.posicoes, resultado.metadados.data_referencia
+                    )
+                except Exception as exc:  # rede/cadastro: degrada com clareza
+                    st.warning(f"Resolução de CNPJ indisponível: {exc}")
+                    resolucoes = None
+
+        estado = {"chave": chave, "resultado": resultado, "resolucoes": resolucoes}
+        st.session_state["import_estado"] = estado
+
+    resultado = estado["resultado"]
+    resolucoes = estado["resolucoes"]
+    meta = resultado.metadados
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Conta", meta.conta or "—")
+    c2.metric("Data de referência", meta.data_referencia or "—")
+    c3.metric("Ativos", str(len(resultado.posicoes)))
+    c4.metric("Soma / Total", brl(resultado.soma_saldos))
+    if meta.patrimonio_total is not None:
+        if resultado.confere_total:
+            st.success(f"Soma dos ativos confere com o patrimônio total: {brl(meta.patrimonio_total)}.")
+        else:
+            st.warning(
+                f"Soma ({brl(resultado.soma_saldos)}) diverge do total do relatório "
+                f"({brl(meta.patrimonio_total)}). Revise antes de gravar."
+            )
+
+    col_t, col_d = st.columns(2)
+    titular_default = "Lidiana" if "Lidiana" in titulares_nomes else titulares_nomes[0]
+    titular_nome = col_t.selectbox("Titular destes ativos", titulares_nomes, index=titulares_nomes.index(titular_default))
+    data_ref = col_d.text_input("Data de referência (snapshot)", value=meta.data_referencia or date.today().isoformat())
+
+    # Monta a tabela de conferência.
+    resol_por_nome = {}
+    if resolucoes:
+        resol_por_nome = {r.nome_extrato: r for r in resolucoes}
+
+    linhas = []
+    for p in resultado.posicoes:
+        r = resol_por_nome.get(p.nome)
+        valor_aplicado = p.valor_aplicado if p.valor_aplicado is not None else round(p.saldo_bruto, 2)
+        data_aplic = p.data_aplicacao or data_ref
+        linhas.append(
+            {
+                "incluir": True,
+                "nome": p.nome,
+                "categoria": p.categoria,
+                "cnpj": cadastro_cvm.formatar_cnpj(r.cnpj) if r and r.cnpj else "",
+                "status_cnpj": r.rotulo_status if r else ("—" if not resolver else "não resolvido"),
+                "saldo_bruto": round(p.saldo_bruto, 2),
+                "quantidade": p.quantidade,
+                "valor_aplicado": valor_aplicado,
+                "data_aplicacao": data_aplic,
+                "taxa_adm_aa": 0.0,
+                "isento_ir": False,
+                "come_cotas": p.categoria in ("Renda Fixa - Pós-fixado", "Crédito Privado", "Fundo Multimercado"),
+            }
+        )
+    df = pd.DataFrame(linhas)
+
+    tem_valor_aplicado = any(p.valor_aplicado is not None for p in resultado.posicoes)
+    st.caption(
+        "Confira e ajuste. O valor aplicado veio do arquivo."
+        if tem_valor_aplicado
+        else "Confira e ajuste. `valor_aplicado` assume o saldo atual por padrão "
+        "(rentabilidade inicia em 0 até você informar o custo real de aquisição)."
+    )
+    editado = st.data_editor(
+        df,
+        key="editor_import",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "incluir": st.column_config.CheckboxColumn("Incluir"),
+            "nome": st.column_config.TextColumn("Ativo", width="large"),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
+            "cnpj": st.column_config.TextColumn("CNPJ"),
+            "status_cnpj": st.column_config.TextColumn("Status CNPJ", disabled=True),
+            "saldo_bruto": st.column_config.NumberColumn("Saldo bruto", format="%.2f"),
+            "quantidade": st.column_config.NumberColumn("Qtd. cotas", format="%.6f"),
+            "valor_aplicado": st.column_config.NumberColumn("Valor aplicado", format="%.2f"),
+            "data_aplicacao": st.column_config.TextColumn("Data aplicação"),
+            "taxa_adm_aa": st.column_config.NumberColumn("Taxa adm (% a.a.)", format="%.2f"),
+            "isento_ir": st.column_config.CheckboxColumn("Isento IR"),
+            "come_cotas": st.column_config.CheckboxColumn("Come-cotas"),
+        },
+    )
+
+    atualizar_existentes = st.checkbox(
+        "Atualizar ativos já cadastrados (mesmo titular e nome): grava snapshot e CNPJ",
+        value=True,
+    )
+
+    if st.button("💾 Gravar selecionados", type="primary"):
+        titular_id = mapa[titular_nome]
+        existentes = {
+            a["nome"].strip().lower(): int(a["id"])
+            for a in database.listar_ativos(titular_id=titular_id, apenas_ativos=False)
+        }
+        criados = atualizados = ignorados = 0
+        total_gravado = 0.0
+        for _, linha in editado.iterrows():
+            if not bool(linha["incluir"]):
+                continue
+            nome = str(linha["nome"]).strip()
+            if not nome:
+                continue
+            cnpj_digitos = "".join(ch for ch in str(linha["cnpj"] or "") if ch.isdigit()) or None
+            saldo = float(linha["saldo_bruto"])
+            data_snap = str(linha["data_aplicacao"]).strip() or (meta.data_referencia or date.today().isoformat())
+
+            existente_id = existentes.get(nome.lower())
+            if existente_id is not None:
+                if not atualizar_existentes:
+                    ignorados += 1
+                    continue
+                campos = {"cnpj": cnpj_digitos, "categoria": str(linha["categoria"])}
+                database.atualizar_ativo(existente_id, campos)
+                database.registrar_snapshot(existente_id, data_snap, saldo)
+                atualizados += 1
+            else:
+                novo_id = database.inserir_ativo(
+                    titular_id=titular_id,
+                    nome=nome,
+                    categoria=str(linha["categoria"]),
+                    taxa_adm_aa=float(linha["taxa_adm_aa"]) or None,
+                    isento_ir=bool(linha["isento_ir"]),
+                    come_cotas=bool(linha["come_cotas"]),
+                    data_aplicacao=data_snap,
+                    valor_aplicado=float(linha["valor_aplicado"]),
+                    cnpj=cnpj_digitos,
+                    observacoes=f"Importado do extrato XP (conta {meta.conta or '?'}, ref. {meta.data_referencia or '?'})",
+                )
+                database.registrar_snapshot(novo_id, data_snap, saldo)
+                criados += 1
+            total_gravado += saldo
+
+        st.success(
+            f"Gravação concluída: {criados} novos, {atualizados} atualizados, "
+            f"{ignorados} ignorados. Total: {brl(round(total_gravado, 2))}."
+        )
+        st.session_state.pop("import_estado", None)
+
+
+# --------------------------------------------------------------------------- #
 # Roteador principal
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -656,6 +832,7 @@ def main() -> None:
         [
             "📊 Painel",
             "📋 Ativos",
+            "📥 Importar extrato",
             "📝 Atualizar valores",
             "🎯 Metas e projeções",
             "🧠 Consultor IA",
@@ -668,14 +845,16 @@ def main() -> None:
     with abas[1]:
         aba_ativos(titular_id)
     with abas[2]:
-        aba_atualizar(titular_id)
+        aba_importar()
     with abas[3]:
-        aba_metas(titular_id)
+        aba_atualizar(titular_id)
     with abas[4]:
-        aba_consultor(titular_id)
+        aba_metas(titular_id)
     with abas[5]:
-        aba_simulador()
+        aba_consultor(titular_id)
     with abas[6]:
+        aba_simulador()
+    with abas[7]:
         aba_proventos_ir(titular_id)
 
 

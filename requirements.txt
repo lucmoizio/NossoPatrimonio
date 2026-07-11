@@ -4,3 +4,5 @@ pandas>=2.2
 requests>=2.32
 yfinance>=0.2.40
 anthropic>=0.34
+pdfplumber>=0.11
+openpyxl>=3.1
