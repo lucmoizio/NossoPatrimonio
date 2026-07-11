@@ -91,7 +91,11 @@ def _buscar_serie(
     """
     caminho = _chave_cache(serie, inicio, fim)
     cache = _ler_cache(caminho)
-    if cache and (time.time() - cache.get("gravado_em", 0)) < _TTL_SEGUNDOS:
+    if (
+        cache
+        and isinstance(cache.get("dados"), list)
+        and (time.time() - cache.get("gravado_em", 0)) < _TTL_SEGUNDOS
+    ):
         return cache["dados"]
 
     url = _URL_SGS.format(serie=serie)
@@ -105,11 +109,56 @@ def _buscar_serie(
         resp = requests.get(url, params=params, timeout=_TIMEOUT)
         resp.raise_for_status()
         dados = resp.json()
+        # O SGS responde HTTP 200 com um dict de erro (ex.: séries diárias sem
+        # dataInicial). Só listas são séries válidas — nunca cacheamos o resto.
+        if not isinstance(dados, list):
+            raise ErroDadosMercado(_msg_erro_sgs(serie, dados))
         _gravar_cache(caminho, dados)
         return dados
     except (requests.RequestException, ValueError) as exc:
         # Fallback: cache antigo (mesmo expirado) mantém o sistema útil offline.
-        if cache and cache.get("dados"):
+        if cache and isinstance(cache.get("dados"), list) and cache["dados"]:
+            return cache["dados"]
+        raise ErroDadosMercado(
+            f"Não foi possível obter a série SGS {serie} do Banco Central "
+            f"e não há cache disponível. Detalhe: {exc}"
+        ) from exc
+
+
+def _msg_erro_sgs(serie: int, corpo: object) -> str:
+    """Extrai a mensagem de erro do corpo devolvido pelo SGS (quando é dict)."""
+    detalhe = ""
+    if isinstance(corpo, dict):
+        detalhe = str(corpo.get("error") or corpo.get("message") or corpo)
+    return f"A API SGS não retornou uma série válida para {serie}. Detalhe: {detalhe}"
+
+
+def _buscar_ultimos(serie: int, n: int = 1) -> list[dict]:
+    """Últimas `n` observações de uma série via endpoint `/dados/ultimos/{n}`.
+
+    Funciona em séries diárias (ex.: Selic meta 432, CDI 4389) sem exigir
+    janela de datas, evitando o limite de 10 anos do SGS.
+    """
+    caminho = _DIR_CACHE / f"sgs_{serie}_ultimos_{n}.json"
+    cache = _ler_cache(caminho)
+    if (
+        cache
+        and isinstance(cache.get("dados"), list)
+        and (time.time() - cache.get("gravado_em", 0)) < _TTL_SEGUNDOS
+    ):
+        return cache["dados"]
+
+    url = _URL_SGS.format(serie=serie) + f"/ultimos/{n}"
+    try:
+        resp = requests.get(url, params={"formato": "json"}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        dados = resp.json()
+        if not isinstance(dados, list):
+            raise ErroDadosMercado(_msg_erro_sgs(serie, dados))
+        _gravar_cache(caminho, dados)
+        return dados
+    except (requests.RequestException, ValueError) as exc:
+        if cache and isinstance(cache.get("dados"), list) and cache["dados"]:
             return cache["dados"]
         raise ErroDadosMercado(
             f"Não foi possível obter a série SGS {serie} do Banco Central "
@@ -158,7 +207,7 @@ def ipca_acumulado(inicio: str, fim: str) -> float:
 def _ultimo_valor(serie: int) -> Optional[float]:
     """Retorna o último valor disponível de uma série (ou None se indisponível)."""
     try:
-        dados = _buscar_serie(serie)
+        dados = _buscar_ultimos(serie, 1)
         if not dados:
             return None
         return _para_float(dados[-1]["valor"])
@@ -178,9 +227,8 @@ def indicadores_atuais() -> IndicadoresAtuais:
     # IPCA 12 meses: acumula os últimos 12 pontos mensais da série 433.
     ipca_12m: Optional[float] = None
     try:
-        dados = _buscar_serie(SERIE_IPCA_MENSAL)
-        if dados:
-            ultimos = dados[-12:]
+        ultimos = _buscar_ultimos(SERIE_IPCA_MENSAL, 12)
+        if ultimos:
             ipca_12m = round(_acumular(ultimos) * 100.0, 2)
     except ErroDadosMercado:
         ipca_12m = None
