@@ -194,8 +194,19 @@ def aba_painel(titular_id: int | None) -> None:
             fig = px.bar(dfb, x="Ativo", y="%", color="Série", barmode="group")
             fig.update_layout(margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
+            total = len(cons.analises)
+            mostrados = len(dados_barras)
+            if mostrados < total:
+                st.caption(
+                    f"Mostrando {mostrados} de {total} ativos. Os demais não têm "
+                    "data de aplicação válida para delimitar o CDI do período — "
+                    "informe a data da 1ª aplicação na aba 📋 Ativos para incluí-los."
+                )
         else:
-            st.caption("Sem CDI de período disponível para os ativos (verifique datas/rede).")
+            st.caption(
+                "Nenhum ativo tem data de aplicação válida para calcular o CDI do "
+                "período. Informe a data da 1ª aplicação na aba 📋 Ativos."
+            )
 
     st.subheader("Evolução patrimonial")
     df_evo = relatorios.evolucao_patrimonial(titular_id=titular_id)
@@ -284,22 +295,92 @@ def aba_ativos(titular_id: int | None) -> None:
         return
 
     st.subheader("Carteira cadastrada")
+    st.caption(
+        "Edite direto na tabela e clique em salvar. A **data de aplicação** é o que "
+        "permite comparar o ativo com o CDI do período — fundos importados da "
+        "planilha vêm com a data de referência; ajuste para a data real da 1ª "
+        "aplicação para que apareçam no gráfico do painel."
+    )
+    orig = {int(a["id"]): a for a in ativos}
     df = pd.DataFrame(
         [
             {
-                "ID": a["id"],
+                "ID": int(a["id"]),
                 "Titular": a["titular_nome"],
                 "Nome": a["nome"],
                 "Categoria": a["categoria"],
-                "CNPJ": a["cnpj"] or "—",
-                "Aplicado": brl(a["valor_aplicado"]),
-                "Isento IR": "Sim" if a["isento_ir"] else "Não",
-                "Ativo": "Sim" if a["ativo"] else "Não",
+                "CNPJ": a["cnpj"] or "",
+                "Data aplicação": a["data_aplicacao"] or "",
+                "Aplicado": float(a["valor_aplicado"] or 0.0),
+                "Isento IR": bool(a["isento_ir"]),
+                "Ativo": bool(a["ativo"]),
             }
             for a in ativos
         ]
     )
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    editado = st.data_editor(
+        df,
+        key="editor_ativos",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ID": st.column_config.NumberColumn("ID", disabled=True),
+            "Titular": st.column_config.TextColumn("Titular", disabled=True),
+            "Nome": st.column_config.TextColumn("Nome", disabled=True),
+            "Categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
+            "CNPJ": st.column_config.TextColumn("CNPJ"),
+            "Data aplicação": st.column_config.TextColumn(
+                "Data aplicação", help="Formato ISO aaaa-mm-dd. Delimita o CDI do período."
+            ),
+            "Aplicado": st.column_config.NumberColumn("Aplicado (R$)", format="%.2f"),
+            "Isento IR": st.column_config.CheckboxColumn("Isento IR"),
+            "Ativo": st.column_config.CheckboxColumn("Ativo"),
+        },
+    )
+    if st.button("💾 Salvar alterações da carteira", type="primary"):
+        alterados = 0
+        erros: list[str] = []
+        for _, linha in editado.iterrows():
+            aid = int(linha["ID"])
+            a = orig.get(aid)
+            if a is None:
+                continue
+            campos: dict[str, object] = {}
+
+            data_nova = str(linha["Data aplicação"]).strip() or None
+            if data_nova is not None:
+                try:
+                    date.fromisoformat(data_nova)
+                except ValueError:
+                    erros.append(f"#{aid} {a['nome']}: data '{data_nova}' inválida (use aaaa-mm-dd).")
+                    continue
+            if data_nova != (a["data_aplicacao"] or None):
+                campos["data_aplicacao"] = data_nova
+
+            cnpj_novo = "".join(ch for ch in str(linha["CNPJ"]) if ch.isdigit()) or None
+            if cnpj_novo != (a["cnpj"] or None):
+                campos["cnpj"] = cnpj_novo
+            if str(linha["Categoria"]) != a["categoria"]:
+                campos["categoria"] = str(linha["Categoria"])
+            if abs(float(linha["Aplicado"]) - float(a["valor_aplicado"] or 0.0)) > 0.001:
+                campos["valor_aplicado"] = float(linha["Aplicado"])
+            if bool(linha["Isento IR"]) != bool(a["isento_ir"]):
+                campos["isento_ir"] = int(bool(linha["Isento IR"]))
+            if bool(linha["Ativo"]) != bool(a["ativo"]):
+                campos["ativo"] = int(bool(linha["Ativo"]))
+
+            if campos:
+                database.atualizar_ativo(aid, campos)
+                alterados += 1
+
+        for e in erros:
+            st.error(e)
+        if alterados:
+            st.success(f"{alterados} ativo(s) atualizado(s).")
+            st.cache_data.clear()
+            st.rerun()
+        elif not erros:
+            st.info("Nenhuma alteração detectada.")
 
     st.subheader("Remover ativo")
     opcoes = {f"#{a['id']} — {a['nome']} ({a['titular_nome']})": int(a["id"]) for a in ativos}
