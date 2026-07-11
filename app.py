@@ -1,0 +1,683 @@
+"""Robô Patrimônio — interface Streamlit (7 abas).
+
+Uso pessoal. Local-first: os dados ficam em `patrimonio.db` na sua máquina.
+Indicadores e cotas vêm apenas de fontes oficiais (BCB, CVM); estimativas são
+sempre rotuladas.
+
+Execução:  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from patrimonio import (
+    analise,
+    consultor,
+    cvm,
+    database,
+    mercado,
+    projecao,
+    relatorios,
+    simulador,
+)
+
+# --------------------------------------------------------------------------- #
+# Constantes de domínio
+# --------------------------------------------------------------------------- #
+CATEGORIAS = [
+    "Renda Fixa - Pós-fixado",
+    "Renda Fixa - Prefixado",
+    "Renda Fixa - Inflação",
+    "Crédito Privado",
+    "Fundo Multimercado",
+    "Fundo de Ações",
+    "Fundo Imobiliário",
+    "FIDC",
+    "COE",
+    "Ações",
+    "Tesouro Direto",
+    "LCI/LCA",
+    "CDB",
+    "Poupança",
+    "Outro",
+]
+
+LIQUIDEZ = ["D+0", "D+1", "D+2", "D+30", "D+90", "No vencimento", "Baixa", "Outra"]
+
+
+# --------------------------------------------------------------------------- #
+# Helpers de formatação pt-BR
+# --------------------------------------------------------------------------- #
+def brl(valor: float | None) -> str:
+    """Formata um número como moeda brasileira: 1234.5 → 'R$ 1.234,50'."""
+    if valor is None:
+        return "—"
+    inteiro = f"{valor:,.2f}"
+    inteiro = inteiro.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {inteiro}"
+
+
+def pct(fracao: float | None, casas: int = 2) -> str:
+    """Formata uma fração decimal como percentual pt-BR: 0.1365 → '13,65%'."""
+    if fracao is None:
+        return "—"
+    texto = f"{fracao * 100:.{casas}f}"
+    return texto.replace(".", ",") + "%"
+
+
+# --------------------------------------------------------------------------- #
+# Setup
+# --------------------------------------------------------------------------- #
+st.set_page_config(page_title="Robô Patrimônio", page_icon="💼", layout="wide")
+database.inicializar()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _indicadores_cache() -> dict:
+    """Cacheia os indicadores oficiais por 1h (a fonte já tem cache de 12h)."""
+    ind = mercado.indicadores_atuais()
+    return {
+        "selic": ind.selic_meta_aa,
+        "cdi": ind.cdi_aa,
+        "ipca": ind.ipca_12m,
+        "consultado_em": ind.consultado_em,
+        "fonte": ind.fonte,
+    }
+
+
+def _mapa_titulares() -> dict[str, int | None]:
+    titulares = database.listar_titulares()
+    mapa: dict[str, int | None] = {"Consolidado": None}
+    for t in titulares:
+        mapa[t["nome"]] = int(t["id"])
+    return mapa
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar: filtro + indicadores oficiais
+# --------------------------------------------------------------------------- #
+def render_sidebar() -> int | None:
+    st.sidebar.title("💼 Robô Patrimônio")
+    mapa = _mapa_titulares()
+    escolha = st.sidebar.radio("Visão", list(mapa.keys()), index=0)
+    titular_id = mapa[escolha]
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Indicadores oficiais")
+    try:
+        ind = _indicadores_cache()
+        st.sidebar.metric("Selic meta (a.a.)", pct((ind["selic"] or 0) / 100) if ind["selic"] is not None else "—")
+        st.sidebar.metric("CDI (a.a.)", pct((ind["cdi"] or 0) / 100) if ind["cdi"] is not None else "—")
+        st.sidebar.metric("IPCA (12m)", pct((ind["ipca"] or 0) / 100) if ind["ipca"] is not None else "—")
+        st.sidebar.caption(f"Fonte: {ind['fonte']}")
+        st.sidebar.caption(f"Consulta: {ind['consultado_em']}")
+    except mercado.ErroDadosMercado as exc:
+        st.sidebar.warning(f"Indicadores indisponíveis: {exc}")
+
+    st.sidebar.divider()
+    st.sidebar.caption(
+        "Uso pessoal. Não substitui assessoria CVM. Estimativas são rotuladas."
+    )
+    return titular_id
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Painel
+# --------------------------------------------------------------------------- #
+def aba_painel(titular_id: int | None) -> None:
+    st.header("📊 Painel consolidado")
+    with st.spinner("Analisando carteira..."):
+        cons = analise.consolidar(titular_id=titular_id)
+
+    if not cons.analises:
+        st.info("Nenhum ativo cadastrado ainda. Vá até a aba 📋 Ativos para começar.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Patrimônio atual", brl(cons.total_atual))
+    c2.metric("Total aplicado", brl(cons.total_aplicado))
+    c3.metric("Ganho bruto", brl(cons.ganho), delta=pct(cons.rent_media_ponderada))
+    c4.metric("Alertas", str(len(cons.alertas)))
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.subheader("Alocação por categoria")
+        if cons.alocacao_categoria:
+            fig = px.pie(
+                names=list(cons.alocacao_categoria.keys()),
+                values=list(cons.alocacao_categoria.values()),
+                hole=0.4,
+            )
+            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        st.subheader("Rentabilidade do ativo × CDI do período")
+        dados_barras = [
+            {
+                "Ativo": a.nome,
+                "Rent. bruta": a.rent_bruta * 100,
+                "CDI do período": (a.cdi_periodo or 0) * 100,
+            }
+            for a in cons.analises
+            if a.cdi_periodo is not None
+        ]
+        if dados_barras:
+            dfb = pd.DataFrame(dados_barras).melt(
+                id_vars="Ativo", var_name="Série", value_name="%"
+            )
+            fig = px.bar(dfb, x="Ativo", y="%", color="Série", barmode="group")
+            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("Sem CDI de período disponível para os ativos (verifique datas/rede).")
+
+    st.subheader("Evolução patrimonial")
+    df_evo = relatorios.evolucao_patrimonial(titular_id=titular_id)
+    if not df_evo.empty and len(df_evo) > 1:
+        fig = px.area(df_evo, x="data", y="total")
+        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), yaxis_title="R$")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("Registre snapshots em datas diferentes para ver a evolução histórica.")
+
+    st.subheader("Tabela analítica por ativo")
+    linhas = []
+    for a in cons.analises:
+        linhas.append(
+            {
+                "Ativo": a.nome,
+                "Titular": a.titular,
+                "Categoria": a.categoria,
+                "Aplicado": brl(a.valor_aplicado),
+                "Atual": brl(a.valor_atual),
+                "Rent. bruta": pct(a.rent_bruta),
+                "% do CDI": pct(a.pct_cdi) if a.pct_cdi is not None else "—",
+                "Rent. real": pct(a.rent_real) if a.rent_real is not None else "—",
+                "IR estimado*": brl(a.ir_estimado),
+            }
+        )
+    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+    st.caption("*IR estimado pela tabela regressiva (Lei 11.033/2004). O Informe de Rendimentos oficial prevalece.")
+
+    if cons.alertas:
+        st.subheader("Alertas")
+        icones = {"revisao": "🔴", "atencao": "🟡", "info": "🔵"}
+        for nome, alerta in cons.alertas:
+            st.write(f"{icones.get(alerta.nivel, '•')} **{nome}** — {alerta.mensagem}")
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Ativos
+# --------------------------------------------------------------------------- #
+def aba_ativos(titular_id: int | None) -> None:
+    st.header("📋 Ativos")
+    mapa = _mapa_titulares()
+    titulares_nomes = [n for n in mapa if n != "Consolidado"]
+
+    with st.expander("➕ Cadastrar novo ativo", expanded=False):
+        with st.form("form_novo_ativo", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            titular_nome = c1.selectbox("Titular", titulares_nomes)
+            nome = c2.text_input("Nome do ativo")
+            c3, c4 = st.columns(2)
+            categoria = c3.selectbox("Categoria", CATEGORIAS)
+            liquidez = c4.selectbox("Liquidez", LIQUIDEZ)
+            c5, c6, c7 = st.columns(3)
+            valor_aplicado = c5.number_input("Valor aplicado (R$)", min_value=0.0, step=100.0)
+            taxa_adm = c6.number_input("Taxa adm. (% a.a.)", min_value=0.0, step=0.1)
+            data_aplicacao = c7.date_input("Data 1ª aplicação", value=date.today())
+            c8, c9 = st.columns(2)
+            cnpj = c8.text_input("CNPJ do fundo (opcional)")
+            isento = c9.checkbox("Isento de IR")
+            come_cotas = c9.checkbox("Sujeito a come-cotas")
+            observacoes = st.text_area("Observações", height=68)
+            enviado = st.form_submit_button("Cadastrar ativo")
+            if enviado:
+                if not nome.strip():
+                    st.error("Informe o nome do ativo.")
+                else:
+                    database.inserir_ativo(
+                        titular_id=mapa[titular_nome],
+                        nome=nome.strip(),
+                        categoria=categoria,
+                        liquidez=liquidez,
+                        taxa_adm_aa=taxa_adm or None,
+                        isento_ir=isento,
+                        come_cotas=come_cotas,
+                        data_aplicacao=data_aplicacao.isoformat(),
+                        valor_aplicado=valor_aplicado,
+                        observacoes=observacoes or None,
+                        cnpj=cnpj.strip() or None,
+                    )
+                    st.success(f"Ativo '{nome}' cadastrado.")
+                    st.rerun()
+
+    ativos = database.listar_ativos(titular_id=titular_id, apenas_ativos=False)
+    if not ativos:
+        st.info("Nenhum ativo cadastrado.")
+        return
+
+    st.subheader("Carteira cadastrada")
+    df = pd.DataFrame(
+        [
+            {
+                "ID": a["id"],
+                "Titular": a["titular_nome"],
+                "Nome": a["nome"],
+                "Categoria": a["categoria"],
+                "CNPJ": a["cnpj"] or "—",
+                "Aplicado": brl(a["valor_aplicado"]),
+                "Isento IR": "Sim" if a["isento_ir"] else "Não",
+                "Ativo": "Sim" if a["ativo"] else "Não",
+            }
+            for a in ativos
+        ]
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Remover ativo")
+    opcoes = {f"#{a['id']} — {a['nome']} ({a['titular_nome']})": int(a["id"]) for a in ativos}
+    escolha = st.selectbox("Selecione", list(opcoes.keys()))
+    col1, col2 = st.columns(2)
+    if col1.button("Desativar (preserva histórico)"):
+        database.desativar_ativo(opcoes[escolha])
+        st.success("Ativo desativado.")
+        st.rerun()
+    if col2.button("Remover definitivamente", type="secondary"):
+        database.remover_ativo(opcoes[escolha])
+        st.warning("Ativo removido definitivamente.")
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Atualizar valores
+# --------------------------------------------------------------------------- #
+def aba_atualizar(titular_id: int | None) -> None:
+    st.header("📝 Atualizar valores")
+    ativos = database.listar_ativos(titular_id=titular_id)
+    if not ativos:
+        st.info("Cadastre ativos primeiro.")
+        return
+
+    st.subheader("Atualização automática via CVM (fundos com CNPJ)")
+    st.caption(
+        "Estima o valor atual pela variação da cota oficial (Informe Diário CVM) "
+        "desde o último snapshot. FIDCs não constam desse informe e ficam manuais."
+    )
+    fundos = [a for a in ativos if a["cnpj"]]
+    if fundos and st.button("🔄 Atualizar fundos pela CVM"):
+        prog = st.progress(0.0)
+        resultados = []
+        for i, a in enumerate(fundos, start=1):
+            snap = database.ultimo_snapshot(int(a["id"]))
+            if snap is None:
+                resultados.append((a["nome"], "sem snapshot de referência — registre um valor manual primeiro"))
+            else:
+                try:
+                    est = cvm.novo_valor_estimado(a["cnpj"], snap["data"], float(snap["valor"]))
+                    if est:
+                        database.registrar_snapshot(int(a["id"]), date.today().isoformat(), est["valor_novo"])
+                        resultados.append(
+                            (a["nome"], f"{brl(est['valor_novo'])} (cota {est['data_cota_atual']}, var {pct(est['variacao'])})")
+                        )
+                    else:
+                        resultados.append((a["nome"], "cota indisponível na CVM (ex.: FIDC) — atualize manualmente"))
+                except cvm.ErroDadosCVM as exc:
+                    resultados.append((a["nome"], f"erro CVM: {exc}"))
+            prog.progress(i / len(fundos))
+        st.write("**Resultado da atualização:**")
+        for nome, msg in resultados:
+            st.write(f"- **{nome}**: {msg}")
+        st.rerun()
+
+    st.divider()
+    st.subheader("Snapshot manual de valor")
+    opcoes = {f"{a['nome']} ({a['titular_nome']})": int(a["id"]) for a in ativos}
+    with st.form("form_snapshot", clear_on_submit=True):
+        escolha = st.selectbox("Ativo", list(opcoes.keys()))
+        c1, c2 = st.columns(2)
+        data_ref = c1.date_input("Data de referência", value=date.today())
+        valor = c2.number_input("Valor bruto (R$)", min_value=0.0, step=100.0)
+        if st.form_submit_button("Registrar snapshot") and valor > 0:
+            database.registrar_snapshot(opcoes[escolha], data_ref.isoformat(), valor)
+            st.success("Snapshot registrado.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Movimentos (aporte / resgate)")
+    st.caption("Movimentos ajustam automaticamente o valor aplicado do ativo.")
+    with st.form("form_movimento", clear_on_submit=True):
+        escolha_m = st.selectbox("Ativo ", list(opcoes.keys()), key="mov_ativo")
+        c1, c2, c3 = st.columns(3)
+        tipo = c1.selectbox("Tipo", ["aporte", "resgate"])
+        data_mov = c2.date_input("Data", value=date.today(), key="mov_data")
+        valor_mov = c3.number_input("Valor (R$)", min_value=0.0, step=100.0, key="mov_valor")
+        if st.form_submit_button("Registrar movimento") and valor_mov > 0:
+            database.registrar_movimento(opcoes[escolha_m], data_mov.isoformat(), tipo, valor_mov)
+            st.success(f"{tipo.capitalize()} registrado.")
+            st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Metas e projeções
+# --------------------------------------------------------------------------- #
+def aba_metas(titular_id: int | None) -> None:
+    st.header("🎯 Metas e projeções")
+    st.caption("Projeções são estimativas. Os cenários derivam do CDI oficial atual.")
+
+    cons = analise.consolidar(titular_id=titular_id)
+    valor_inicial = cons.total_atual
+
+    with st.form("form_meta"):
+        c1, c2 = st.columns(2)
+        valor_alvo = c1.number_input("Meta de patrimônio (R$)", min_value=0.0, value=3_000_000.0, step=50_000.0)
+        prazo = c2.number_input("Prazo (anos)", min_value=1, value=10, step=1)
+        c3, c4 = st.columns(2)
+        aporte = c3.number_input("Aporte anual (R$)", min_value=0.0, value=100_000.0, step=10_000.0)
+        c4.metric("Patrimônio inicial (atual)", brl(valor_inicial))
+        simular = st.form_submit_button("Projetar cenários")
+
+    if simular or valor_alvo > 0:
+        cdi_liq = projecao.cdi_liquido_atual()
+        if cdi_liq is None:
+            st.warning(
+                "CDI oficial indisponível no momento — não é possível projetar os "
+                "cenários sem inventar taxas. Tente novamente mais tarde."
+            )
+            return
+
+        st.info(f"CDI líquido de referência (a.a.): {pct(cdi_liq)} (bruto menos 15% de IR de longo prazo).")
+        cenarios = projecao.cenarios_padrao(valor_inicial, aporte, int(prazo), valor_alvo, cdi_liq)
+
+        cols = st.columns(len(cenarios))
+        for col, cen in zip(cols, cenarios):
+            col.metric(
+                cen.nome.split(" (")[0],
+                brl(cen.valor_final),
+                delta=(f"meta em {cen.anos_ate_meta} anos" if cen.anos_ate_meta is not None else "meta não atingida"),
+            )
+
+        fig = go.Figure()
+        for cen in cenarios:
+            fig.add_trace(
+                go.Scatter(
+                    x=[p.ano for p in cen.trajetoria],
+                    y=[p.valor for p in cen.trajetoria],
+                    mode="lines+markers",
+                    name=cen.nome,
+                )
+            )
+        fig.add_hline(y=valor_alvo, line_dash="dash", annotation_text="Meta")
+        fig.update_layout(xaxis_title="Ano", yaxis_title="R$", margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        dobrar = projecao.tempo_para_dobrar(cenarios[1].taxa_aa)
+        if dobrar:
+            st.caption(f"No cenário base, o capital dobra em ~{dobrar} anos (sem novos aportes).")
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Consultor IA
+# --------------------------------------------------------------------------- #
+def aba_consultor(titular_id: int | None) -> None:
+    st.header("🧠 Consultor IA")
+    if not consultor.disponivel():
+        st.warning(
+            "Consultor IA indisponível. Defina a variável de ambiente "
+            "`ANTHROPIC_API_KEY` e instale as dependências para habilitá-lo. "
+            "As demais abas funcionam normalmente."
+        )
+        return
+
+    st.caption(
+        f"Modelo: {consultor.modelo_atual()}. As perguntas são enviadas à API da "
+        "Anthropic (única exceção ao local-first). O consultor busca taxas atuais "
+        "em fontes oficiais e não substitui um assessor CVM."
+    )
+
+    incluir_contexto = st.checkbox("Incluir minha carteira consolidada no contexto", value=False)
+
+    if "chat_consultor" not in st.session_state:
+        st.session_state.chat_consultor = []
+
+    for msg in st.session_state.chat_consultor:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pergunta = st.chat_input("Pergunte sobre uma aplicação, taxa, realocação...")
+    if pergunta:
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+
+        contexto = None
+        if incluir_contexto:
+            cons = analise.consolidar(titular_id=titular_id)
+            linhas = [
+                f"- {a.nome} ({a.categoria}): atual {brl(a.valor_atual)}, "
+                f"rent. {pct(a.rent_bruta)}, %CDI {pct(a.pct_cdi) if a.pct_cdi else 'n/d'}"
+                for a in cons.analises
+            ]
+            contexto = (
+                f"Patrimônio atual {brl(cons.total_atual)}, aplicado {brl(cons.total_aplicado)}.\n"
+                + "\n".join(linhas)
+            )
+
+        with st.chat_message("assistant"):
+            with st.spinner("Consultando fontes oficiais..."):
+                try:
+                    resp = consultor.perguntar(
+                        pergunta,
+                        historico=st.session_state.chat_consultor,
+                        contexto_carteira=contexto,
+                    )
+                    st.markdown(resp.texto)
+                    if resp.buscas_realizadas:
+                        st.caption("Buscas: " + "; ".join(resp.buscas_realizadas))
+                    texto_resposta = resp.texto
+                except Exception as exc:  # erro de API/rede: degrada com clareza
+                    texto_resposta = f"Erro ao consultar: {exc}"
+                    st.error(texto_resposta)
+
+        st.session_state.chat_consultor.append({"role": "user", "content": pergunta})
+        st.session_state.chat_consultor.append({"role": "assistant", "content": texto_resposta})
+
+    if st.session_state.chat_consultor and st.button("Limpar conversa"):
+        st.session_state.chat_consultor = []
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Simulador
+# --------------------------------------------------------------------------- #
+def aba_simulador() -> None:
+    st.header("🎮 Simulador (paper trading B3)")
+    st.caption(
+        "Filosofia core-satellite: a carteira real é o núcleo conservador; aqui "
+        "você testa ideias com dinheiro fictício. O teste da verdade é bater o CDI."
+    )
+
+    cfg = database.obter_sim_config()
+    with st.expander("⚙️ Configurar simulador", expanded=cfg is None):
+        with st.form("form_sim_cfg"):
+            c1, c2 = st.columns(2)
+            saldo = c1.number_input(
+                "Saldo inicial fictício (R$)", min_value=0.0,
+                value=float(cfg["saldo_inicial"]) if cfg else 100_000.0, step=1000.0,
+            )
+            data_inicio = c2.date_input(
+                "Data de início", value=date.fromisoformat(cfg["data_inicio"]) if cfg else date.today()
+            )
+            c3, c4 = st.columns(2)
+            custo = c3.number_input("Custo por ordem (%)", min_value=0.0, value=float(cfg["custo_pct"]) if cfg else 0.03, step=0.01)
+            trava = c4.number_input("Trava de perda (%)", min_value=0.0, value=float(cfg["limite_perda_pct"]) if cfg else 20.0, step=1.0)
+            if st.form_submit_button("Salvar configuração"):
+                simulador.configurar(saldo, data_inicio.isoformat(), custo, trava)
+                st.success("Simulador configurado.")
+                st.rerun()
+
+    if cfg is None:
+        st.info("Configure o simulador acima para começar.")
+        return
+
+    st.subheader("Nova ordem")
+    with st.form("form_ordem", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        codigo = c1.text_input("Ticker B3 (ex.: PETR4, BOVA11)")
+        tipo = c2.selectbox("Tipo", ["compra", "venda"])
+        qtd = c3.number_input("Quantidade", min_value=0.0, step=1.0)
+        enviar = st.form_submit_button("Enviar ordem (a mercado)")
+        if enviar and codigo.strip() and qtd > 0:
+            try:
+                if tipo == "compra":
+                    r = simulador.comprar(codigo, qtd)
+                else:
+                    r = simulador.vender(codigo, qtd)
+                st.success(f"{tipo.capitalize()} de {qtd} {r['ticker']} a {brl(r['preco'])} (custos {brl(r['custos'])}).")
+                st.rerun()
+            except simulador.ErroSimulador as exc:
+                st.error(str(exc))
+
+    res = simulador.resultado()
+    if res:
+        st.subheader("Placar")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Patrimônio", brl(res.patrimonio), delta=pct(res.rent_pct / 100))
+        c2.metric("Caixa", brl(res.caixa))
+        c3.metric("Em posições", brl(res.valor_posicoes))
+        c4.metric(
+            "vs CDI",
+            f"{res.vs_cdi_pp:+.2f} p.p." if res.vs_cdi_pp is not None else "—",
+            delta=(f"CDI {res.cdi_periodo_pct:.2f}%" if res.cdi_periodo_pct is not None else None),
+        )
+        if res.trava_atingida:
+            st.error(f"🔴 Trava de perda de {res.limite_perda_pct:.0f}% atingida!")
+        for aviso in res.avisos:
+            st.warning(aviso)
+        if res.posicoes:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Ticker": p["ticker"],
+                            "Qtd": p["quantidade"],
+                            "Preço médio": brl(p["preco_medio"]),
+                            "Preço atual": brl(p["preco_atual"]),
+                            "Valor": brl(p["valor"]),
+                            "Resultado": brl(p["resultado"]),
+                        }
+                        for p in res.posicoes
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if st.button("Reiniciar simulador (zera tudo)"):
+        simulador.reiniciar()
+        st.warning("Simulador reiniciado.")
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Proventos & IR
+# --------------------------------------------------------------------------- #
+def aba_proventos_ir(titular_id: int | None) -> None:
+    st.header("💰 Proventos & IR")
+    ativos = database.listar_ativos(titular_id=titular_id, apenas_ativos=False)
+    if not ativos:
+        st.info("Cadastre ativos primeiro.")
+        return
+    opcoes = {f"{a['nome']} ({a['titular_nome']})": int(a["id"]) for a in ativos}
+
+    st.subheader("Registrar provento")
+    with st.form("form_provento", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        escolha = c1.selectbox("Ativo", list(opcoes.keys()))
+        tipo = c2.selectbox("Tipo", ["Dividendo", "JCP", "Rendimento", "Juros", "Amortização", "Outro"])
+        c3, c4 = st.columns(2)
+        data_ref = c3.date_input("Data", value=date.today())
+        valor = c4.number_input("Valor (R$)", min_value=0.0, step=10.0)
+        if st.form_submit_button("Registrar") and valor > 0:
+            database.registrar_provento(opcoes[escolha], data_ref.isoformat(), tipo, valor)
+            st.success("Provento registrado.")
+            st.rerun()
+
+    ano = st.number_input("Ano-base", min_value=2000, max_value=2100, value=date.today().year, step=1)
+
+    st.subheader("Renda passiva")
+    resumo = relatorios.resumo_proventos(int(ano), titular_id=titular_id)
+    c1, c2 = st.columns(2)
+    c1.metric("Total no ano", brl(resumo.total_ano))
+    c2.metric("Média mensal", brl(resumo.media_mensal))
+    if resumo.por_mes:
+        dfm = pd.DataFrame({"Mês": list(resumo.por_mes.keys()), "R$": list(resumo.por_mes.values())})
+        st.plotly_chart(px.bar(dfm, x="Mês", y="R$"), use_container_width=True)
+
+    st.subheader("Relatório de IR (auxílio de preenchimento)")
+    rel = relatorios.relatorio_ir(int(ano), titular_id=titular_id)
+    st.info(rel.aviso)
+    if rel.bens_direitos:
+        df_bd = pd.DataFrame(
+            [
+                {
+                    "Ativo": b.nome,
+                    "Titular": b.titular,
+                    "Categoria": b.categoria,
+                    "CNPJ": b.cnpj or "—",
+                    f"Situação em 31/12/{rel.ano_anterior}": brl(b.situacao_ano_anterior),
+                    f"Situação em 31/12/{rel.ano_base}": brl(b.situacao_ano_base),
+                }
+                for b in rel.bens_direitos
+            ]
+        )
+        st.dataframe(df_bd, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Sem posições registradas em 31/12 dos anos considerados.")
+
+    if rel.proventos_por_tipo:
+        st.write("**Proventos do ano por tipo:**")
+        for tipo_p, total in rel.proventos_por_tipo.items():
+            st.write(f"- {tipo_p}: {brl(total)}")
+
+
+# --------------------------------------------------------------------------- #
+# Roteador principal
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    titular_id = render_sidebar()
+    abas = st.tabs(
+        [
+            "📊 Painel",
+            "📋 Ativos",
+            "📝 Atualizar valores",
+            "🎯 Metas e projeções",
+            "🧠 Consultor IA",
+            "🎮 Simulador",
+            "💰 Proventos & IR",
+        ]
+    )
+    with abas[0]:
+        aba_painel(titular_id)
+    with abas[1]:
+        aba_ativos(titular_id)
+    with abas[2]:
+        aba_atualizar(titular_id)
+    with abas[3]:
+        aba_metas(titular_id)
+    with abas[4]:
+        aba_consultor(titular_id)
+    with abas[5]:
+        aba_simulador()
+    with abas[6]:
+        aba_proventos_ir(titular_id)
+
+
+if __name__ == "__main__":
+    main()

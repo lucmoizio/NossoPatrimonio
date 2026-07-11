@@ -1,0 +1,28 @@
+# Banco de dados local (dados pessoais — nunca versionar)
+patrimonio.db
+patrimonio.db-journal
+patrimonio.db-wal
+patrimonio.db-shm
+
+# Caches locais de APIs oficiais
+.cache_mercado/
+.cache_cvm/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Ambiente
+.env
+
+# Sistema operacional / editor
+.DS_Store
+.idea/
+.vscode/
