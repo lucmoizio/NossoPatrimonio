@@ -1,4 +1,4 @@
-# Robô Patrimônio
+# Investimentos & Patrimônio Lutcho e Lidy
 
 Sistema pessoal de gestão e análise patrimonial (uso estritamente pessoal).
 Local-first: todos os dados ficam em um banco SQLite na sua máquina

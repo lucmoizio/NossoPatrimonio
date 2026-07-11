@@ -183,6 +183,39 @@ def id_titular(nome: str, caminho: Optional[Path] = None) -> Optional[int]:
 
 
 # --------------------------------------------------------------------------- #
+# Reset (zerar dados)
+# --------------------------------------------------------------------------- #
+def zerar_dados(
+    caminho: Optional[Path] = None,
+    *,
+    incluir_metas: bool = True,
+    incluir_simulador: bool = True,
+) -> dict[str, int]:
+    """Apaga os dados do usuário e retorna quantas linhas foram removidas.
+
+    Sempre limpa carteira (ativos, snapshots, movimentos, proventos). Metas e
+    simulador são opcionais. Os titulares fixos são preservados (e regarantidos).
+    Operação irreversível — a UI exige confirmação explícita.
+    """
+    tabelas = ["proventos", "movimentos", "snapshots", "ativos"]
+    if incluir_metas:
+        tabelas.append("metas")
+    if incluir_simulador:
+        tabelas += ["sim_ordens", "sim_config"]
+
+    removidos: dict[str, int] = {}
+    with transacao(caminho) as con:
+        for tabela in tabelas:
+            n = con.execute(f"SELECT COUNT(*) AS c FROM {tabela}").fetchone()["c"]
+            con.execute(f"DELETE FROM {tabela}")
+            removidos[tabela] = int(n)
+        # Regarante os titulares fixos (caso algum tenha sido removido).
+        for nome in TITULARES_PADRAO:
+            con.execute("INSERT OR IGNORE INTO titulares (nome) VALUES (?)", (nome,))
+    return removidos
+
+
+# --------------------------------------------------------------------------- #
 # Ativos
 # --------------------------------------------------------------------------- #
 def inserir_ativo(

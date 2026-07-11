@@ -1,4 +1,4 @@
-"""Robô Patrimônio — interface Streamlit (8 abas).
+"""Investimentos & Patrimônio Lutcho e Lidy — interface Streamlit (8 abas).
 
 Uso pessoal. Local-first: os dados ficam em `patrimonio.db` na sua máquina.
 Indicadores e cotas vêm apenas de fontes oficiais (BCB, CVM); estimativas são
@@ -55,7 +55,9 @@ def pct(fracao: float | None, casas: int = 2) -> str:
 # --------------------------------------------------------------------------- #
 # Setup
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Robô Patrimônio", page_icon="💼", layout="wide")
+st.set_page_config(
+    page_title="Investimentos & Patrimônio Lutcho e Lidy", page_icon="💼", layout="wide"
+)
 database.inicializar()
 
 
@@ -84,7 +86,8 @@ def _mapa_titulares() -> dict[str, int | None]:
 # Sidebar: filtro + indicadores oficiais
 # --------------------------------------------------------------------------- #
 def render_sidebar() -> int | None:
-    st.sidebar.title("💼 Robô Patrimônio")
+    st.sidebar.title("💼 Investimentos & Patrimônio")
+    st.sidebar.caption("Lutcho & Lidy")
     mapa = _mapa_titulares()
     escolha = st.sidebar.radio("Visão", list(mapa.keys()), index=0)
     titular_id = mapa[escolha]
@@ -102,10 +105,45 @@ def render_sidebar() -> int | None:
         st.sidebar.warning(f"Indicadores indisponíveis: {exc}")
 
     st.sidebar.divider()
+    _sidebar_zerar_dados()
+
+    st.sidebar.divider()
     st.sidebar.caption(
         "Uso pessoal. Não substitui assessoria CVM. Estimativas são rotuladas."
     )
     return titular_id
+
+
+def _sidebar_zerar_dados() -> None:
+    """Seção de reset: apaga os dados da plataforma após dupla confirmação."""
+    with st.sidebar.expander("⚠️ Zerar dados", expanded=False):
+        st.caption(
+            "Apaga toda a carteira (ativos, snapshots, aportes/resgates e "
+            "proventos) para recomeçar as importações do zero. Os titulares "
+            "são mantidos. Ação irreversível."
+        )
+        incluir_metas = st.checkbox("Apagar também metas", value=True, key="zerar_metas")
+        incluir_sim = st.checkbox("Apagar também simulador", value=True, key="zerar_sim")
+        confirma = st.checkbox(
+            "Entendo que esta ação é irreversível", value=False, key="zerar_confirma"
+        )
+        if st.button(
+            "🗑️ Apagar todos os dados", type="primary", disabled=not confirma
+        ):
+            removidos = database.zerar_dados(
+                incluir_metas=incluir_metas, incluir_simulador=incluir_sim
+            )
+            total = sum(removidos.values())
+            # Limpa estados de importação e caches em memória.
+            st.session_state.pop("import_estado", None)
+            st.cache_data.clear()
+            st.success(
+                f"Dados zerados: {total} registros removidos "
+                f"({', '.join(f'{k}={v}' for k, v in removidos.items() if v)} )."
+                if total
+                else "Não havia dados para apagar."
+            )
+            st.rerun()
 
 
 # --------------------------------------------------------------------------- #

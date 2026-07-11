@@ -1,4 +1,4 @@
-"""Robô Patrimônio — pacote de domínio.
+"""Investimentos & Patrimônio Lutcho e Lidy — pacote de domínio.
 
 Módulos:
     database   — persistência SQLite + migrações leves
