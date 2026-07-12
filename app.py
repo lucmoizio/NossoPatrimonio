@@ -62,6 +62,35 @@ def pct(fracao: float | None, casas: int = 2) -> str:
     return texto.replace(".", ",") + "%"
 
 
+def data_br(iso: str | None) -> str:
+    """Data ISO para pt-BR: '2024-03-22' → '22/03/2024'."""
+    if not iso:
+        return "—"
+    try:
+        return date.fromisoformat(str(iso)[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return str(iso)
+
+
+def mes_br(aaaa_mm: str) -> str:
+    """Competência ISO para pt-BR: '2026-01' → '01/2026'."""
+    try:
+        ano, mes = str(aaaa_mm).split("-")[:2]
+        return f"{int(mes):02d}/{ano}"
+    except (ValueError, IndexError):
+        return str(aaaa_mm)
+
+
+def _iso_de_celula(valor) -> str | None:
+    """Converte a célula de data de um data_editor (Timestamp/NaT/date/str) em ISO."""
+    if valor is None:
+        return None
+    ts = pd.to_datetime(valor, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date().isoformat()
+
+
 # --------------------------------------------------------------------------- #
 # Setup
 # --------------------------------------------------------------------------- #
@@ -222,7 +251,9 @@ def aba_painel(titular_id: int | None) -> None:
     df_evo = relatorios.evolucao_patrimonial(titular_id=titular_id)
     if not df_evo.empty and len(df_evo) > 1:
         fig = px.area(df_evo, x="data", y="total")
-        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), yaxis_title="R$")
+        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), yaxis_title="R$", xaxis_title="Data")
+        fig.update_xaxes(tickformat="%d/%m/%Y")
+        fig.update_traces(hovertemplate="%{x|%d/%m/%Y}<br>R$ %{y:,.2f}<extra></extra>")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.caption("Registre snapshots em datas diferentes para ver a evolução histórica.")
@@ -272,7 +303,7 @@ def aba_ativos(titular_id: int | None) -> None:
             c5, c6, c7 = st.columns(3)
             valor_aplicado = c5.number_input("Valor aplicado (R$)", min_value=0.0, step=100.0)
             taxa_adm = c6.number_input("Taxa adm. (% a.a.)", min_value=0.0, step=0.1)
-            data_aplicacao = c7.date_input("Data 1ª aplicação", value=date.today())
+            data_aplicacao = c7.date_input("Data 1ª aplicação", value=date.today(), format="DD/MM/YYYY")
             c8, c9 = st.columns(2)
             cnpj = c8.text_input("CNPJ do fundo (opcional)")
             isento = c9.checkbox("Isento de IR")
@@ -328,6 +359,7 @@ def aba_ativos(titular_id: int | None) -> None:
             for a in ativos
         ]
     )
+    df["Data aplicação"] = pd.to_datetime(df["Data aplicação"], errors="coerce")
     editado = st.data_editor(
         df,
         key="editor_ativos",
@@ -339,8 +371,8 @@ def aba_ativos(titular_id: int | None) -> None:
             "Nome": st.column_config.TextColumn("Nome", disabled=True),
             "Categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
             "CNPJ": st.column_config.TextColumn("CNPJ"),
-            "Data aplicação": st.column_config.TextColumn(
-                "Data aplicação", help="Formato ISO aaaa-mm-dd. Delimita o CDI do período."
+            "Data aplicação": st.column_config.DateColumn(
+                "Data aplicação", format="DD/MM/YYYY", help="Delimita o CDI do período."
             ),
             "Aplicado": st.column_config.NumberColumn("Aplicado (R$)", format="%.2f"),
             "Isento IR": st.column_config.CheckboxColumn("Isento IR"),
@@ -349,7 +381,6 @@ def aba_ativos(titular_id: int | None) -> None:
     )
     if st.button("💾 Salvar alterações da carteira", type="primary"):
         alterados = 0
-        erros: list[str] = []
         for _, linha in editado.iterrows():
             aid = int(linha["ID"])
             a = orig.get(aid)
@@ -357,13 +388,7 @@ def aba_ativos(titular_id: int | None) -> None:
                 continue
             campos: dict[str, object] = {}
 
-            data_nova = str(linha["Data aplicação"]).strip() or None
-            if data_nova is not None:
-                try:
-                    date.fromisoformat(data_nova)
-                except ValueError:
-                    erros.append(f"#{aid} {a['nome']}: data '{data_nova}' inválida (use aaaa-mm-dd).")
-                    continue
+            data_nova = _iso_de_celula(linha["Data aplicação"])
             if data_nova != (a["data_aplicacao"] or None):
                 campos["data_aplicacao"] = data_nova
 
@@ -383,13 +408,11 @@ def aba_ativos(titular_id: int | None) -> None:
                 database.atualizar_ativo(aid, campos)
                 alterados += 1
 
-        for e in erros:
-            st.error(e)
         if alterados:
             st.success(f"{alterados} ativo(s) atualizado(s).")
             st.cache_data.clear()
             st.rerun()
-        elif not erros:
+        else:
             st.info("Nenhuma alteração detectada.")
 
     st.subheader("Remover ativo")
@@ -435,7 +458,7 @@ def aba_atualizar(titular_id: int | None) -> None:
                     if est:
                         database.registrar_snapshot(int(a["id"]), date.today().isoformat(), est["valor_novo"])
                         resultados.append(
-                            (a["nome"], f"{brl(est['valor_novo'])} (cota {est['data_cota_atual']}, var {pct(est['variacao'])})")
+                            (a["nome"], f"{brl(est['valor_novo'])} (cota {data_br(est['data_cota_atual'])}, var {pct(est['variacao'])})")
                         )
                     else:
                         resultados.append((a["nome"], "cota indisponível na CVM (ex.: FIDC) — atualize manualmente"))
@@ -453,7 +476,7 @@ def aba_atualizar(titular_id: int | None) -> None:
     with st.form("form_snapshot", clear_on_submit=True):
         escolha = st.selectbox("Ativo", list(opcoes.keys()))
         c1, c2 = st.columns(2)
-        data_ref = c1.date_input("Data de referência", value=date.today())
+        data_ref = c1.date_input("Data de referência", value=date.today(), format="DD/MM/YYYY")
         valor = c2.number_input("Valor bruto (R$)", min_value=0.0, step=100.0)
         if st.form_submit_button("Registrar snapshot") and valor > 0:
             database.registrar_snapshot(opcoes[escolha], data_ref.isoformat(), valor)
@@ -467,7 +490,7 @@ def aba_atualizar(titular_id: int | None) -> None:
         escolha_m = st.selectbox("Ativo ", list(opcoes.keys()), key="mov_ativo")
         c1, c2, c3 = st.columns(3)
         tipo = c1.selectbox("Tipo", ["aporte", "resgate"])
-        data_mov = c2.date_input("Data", value=date.today(), key="mov_data")
+        data_mov = c2.date_input("Data", value=date.today(), key="mov_data", format="DD/MM/YYYY")
         valor_mov = c3.number_input("Valor (R$)", min_value=0.0, step=100.0, key="mov_valor")
         if st.form_submit_button("Registrar movimento") and valor_mov > 0:
             database.registrar_movimento(opcoes[escolha_m], data_mov.isoformat(), tipo, valor_mov)
@@ -622,7 +645,9 @@ def aba_simulador() -> None:
                 value=float(cfg["saldo_inicial"]) if cfg else 100_000.0, step=1000.0,
             )
             data_inicio = c2.date_input(
-                "Data de início", value=date.fromisoformat(cfg["data_inicio"]) if cfg else date.today()
+                "Data de início",
+                value=date.fromisoformat(cfg["data_inicio"]) if cfg else date.today(),
+                format="DD/MM/YYYY",
             )
             c3, c4 = st.columns(2)
             custo = c3.number_input("Custo por ordem (%)", min_value=0.0, value=float(cfg["custo_pct"]) if cfg else 0.03, step=0.01)
@@ -712,7 +737,7 @@ def aba_proventos_ir(titular_id: int | None) -> None:
         escolha = c1.selectbox("Ativo", list(opcoes.keys()))
         tipo = c2.selectbox("Tipo", ["Dividendo", "JCP", "Rendimento", "Juros", "Amortização", "Outro"])
         c3, c4 = st.columns(2)
-        data_ref = c3.date_input("Data", value=date.today())
+        data_ref = c3.date_input("Data", value=date.today(), format="DD/MM/YYYY")
         valor = c4.number_input("Valor (R$)", min_value=0.0, step=10.0)
         if st.form_submit_button("Registrar") and valor > 0:
             database.registrar_provento(opcoes[escolha], data_ref.isoformat(), tipo, valor)
@@ -727,7 +752,7 @@ def aba_proventos_ir(titular_id: int | None) -> None:
     c1.metric("Total no ano", brl(resumo.total_ano))
     c2.metric("Média mensal", brl(resumo.media_mensal))
     if resumo.por_mes:
-        dfm = pd.DataFrame({"Mês": list(resumo.por_mes.keys()), "R$": list(resumo.por_mes.values())})
+        dfm = pd.DataFrame({"Mês": [mes_br(m) for m in resumo.por_mes], "R$": list(resumo.por_mes.values())})
         st.plotly_chart(px.bar(dfm, x="Mês", y="R$"), use_container_width=True)
 
     st.subheader("Relatório de IR (auxílio de preenchimento)")
@@ -823,7 +848,7 @@ def aba_importar() -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Conta", meta.conta or "—")
-    c2.metric("Data de referência", meta.data_referencia or "—")
+    c2.metric("Data de referência", data_br(meta.data_referencia))
     c3.metric("Ativos", str(len(resultado.posicoes)))
     c4.metric("Soma / Total", brl(resultado.soma_saldos))
     if meta.patrimonio_total is not None:
@@ -838,7 +863,13 @@ def aba_importar() -> None:
     col_t, col_d = st.columns(2)
     titular_default = "Lidiana" if "Lidiana" in titulares_nomes else titulares_nomes[0]
     titular_nome = col_t.selectbox("Titular destes ativos", titulares_nomes, index=titulares_nomes.index(titular_default))
-    data_ref = col_d.text_input("Data de referência (snapshot)", value=meta.data_referencia or date.today().isoformat())
+    try:
+        ref_default = date.fromisoformat(meta.data_referencia) if meta.data_referencia else date.today()
+    except ValueError:
+        ref_default = date.today()
+    data_ref = col_d.date_input(
+        "Data de referência (snapshot)", value=ref_default, format="DD/MM/YYYY"
+    ).isoformat()
 
     # Monta a tabela de conferência.
     resol_por_nome = {}
@@ -867,6 +898,7 @@ def aba_importar() -> None:
             }
         )
     df = pd.DataFrame(linhas)
+    df["data_aplicacao"] = pd.to_datetime(df["data_aplicacao"], errors="coerce")
 
     tem_valor_aplicado = any(p.valor_aplicado is not None for p in resultado.posicoes)
     st.caption(
@@ -889,7 +921,7 @@ def aba_importar() -> None:
             "saldo_bruto": st.column_config.NumberColumn("Saldo bruto", format="%.2f"),
             "quantidade": st.column_config.NumberColumn("Qtd. cotas", format="%.6f"),
             "valor_aplicado": st.column_config.NumberColumn("Valor aplicado", format="%.2f"),
-            "data_aplicacao": st.column_config.TextColumn("Data aplicação"),
+            "data_aplicacao": st.column_config.DateColumn("Data aplicação", format="DD/MM/YYYY"),
             "taxa_adm_aa": st.column_config.NumberColumn("Taxa adm (% a.a.)", format="%.2f"),
             "isento_ir": st.column_config.CheckboxColumn("Isento IR"),
             "come_cotas": st.column_config.CheckboxColumn("Come-cotas"),
@@ -917,7 +949,7 @@ def aba_importar() -> None:
                 continue
             cnpj_digitos = "".join(ch for ch in str(linha["cnpj"] or "") if ch.isdigit()) or None
             saldo = float(linha["saldo_bruto"])
-            data_snap = str(linha["data_aplicacao"]).strip() or (meta.data_referencia or date.today().isoformat())
+            data_snap = _iso_de_celula(linha["data_aplicacao"]) or data_ref
 
             existente_id = existentes.get(nome.lower())
             if existente_id is not None:
