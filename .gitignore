@@ -8,6 +8,9 @@ patrimonio.db-shm
 .cache_mercado/
 .cache_cvm/
 
+# Log do motor de atualização
+atualizar.log
+
 # Python
 __pycache__/
 *.py[cod]

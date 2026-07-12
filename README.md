@@ -66,21 +66,112 @@ python importar_dados_lidiana.py
 
 ```
 robo-patrimonio/
-├── app.py                      # UI Streamlit — 7 abas
+├── app.py                      # UI Streamlit — 10 abas
+├── atualizar.py                # motor de atualização (CLI para cron/launchd)
 ├── importar_dados_lidiana.py   # seed da carteira XP (template)
 ├── requirements.txt
 ├── patrimonio.db               # criado no 1º uso (gitignore)
 ├── .cache_mercado/ .cache_cvm/ # caches locais de APIs (gitignore)
+├── tests/                      # pytest (parsers + comparação de performance)
 └── patrimonio/
     ├── database.py   # persistência + migrações leves (PRAGMA table_info)
     ├── mercado.py    # BCB/SGS: CDI, Selic, IPCA
-    ├── cvm.py        # informes diários de fundos → atualização automática
+    ├── cvm.py        # Informe Diário de fundos → cotas/PL + cache em banco
+    ├── fundos.py     # camada normalizada de cotas (Cotacao/FonteCVM) + sync
+    ├── cadastro_cvm.py # resolução de CNPJ + cadastro de classes CVM
+    ├── recomendacao.py # comparação por classe (6/12/24m) + alternativas
     ├── analise.py    # motor de análise por ativo + consolidação + alertas
     ├── projecao.py   # juros compostos, cenários, anos-até-meta
     ├── relatorios.py # evolução patrimonial, proventos, relatório IR
     ├── consultor.py  # Consultor IA (Anthropic API + web search)
     └── simulador.py  # paper trading B3 com travas
 ```
+
+## Fontes de dados (oficiais)
+
+Somente fontes oficiais e gratuitas, sem credenciais de terceiros:
+
+| Dado | Fonte | Endpoint/arquivo | Defasagem |
+|---|---|---|---|
+| CDI, Selic, IPCA (benchmark) | Banco Central (SGS) | `api.bcb.gov.br` | ~1 dia útil |
+| Cota, PL e nº de cotistas de fundos | CVM — Informe Diário FIF | `inf_diario_fi_AAAAMM.zip` | ~1 dia útil |
+| Classe/tipo do fundo (para pares) | CVM — Cadastro | `registro_fundo_classe.zip` | atualização periódica |
+
+Limitações conhecidas (nada é tempo real):
+- A CVM publica o Informe Diário com ~1 dia útil de atraso; o app trabalha com
+  o último pregão disponível.
+- **FIDC** não consta do Informe Diário FIF (divulgação própria) — fica manual.
+- Renda fixa bancária (CDB/LCI/LCA) e Tesouro Direto não têm CNPJ de fundo.
+- O cadastro da CVM **não traz a taxa de administração**; por isso a comparação
+  de pares usa desempenho relativo e a taxa do fundo sugerido deve ser conferida.
+
+## Motor de atualização automática
+
+`atualizar.py` sincroniza as cotas dos fundos da carteira no cache local
+(`cotas_fundos`, idempotente por CNPJ+data), grava um novo snapshot por ativo a
+partir da variação de cota e alerta sobre fundos defasados. Uso:
+
+```bash
+python atualizar.py                # sincroniza cotas + snapshots da carteira
+python atualizar.py --cadastro     # também atualiza o cadastro de classes CVM
+python atualizar.py --universo      # reconstrói o universo de pares por classe (pesado)
+python atualizar.py --defasagem 7   # muda o limite (dias úteis) do alerta de atraso
+```
+
+Agendamento (rodar em dias úteis, após ~20h, quando o Informe já saiu):
+
+- cron (Linux/macOS):
+
+```cron
+0 20 * * 1-5 cd /caminho/NossoPatrimonio && /caminho/.venv/bin/python atualizar.py --silencioso
+```
+
+- launchd (macOS), `~/Library/LaunchAgents/com.nossopatrimonio.atualizar.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.nossopatrimonio.atualizar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/caminho/.venv/bin/python</string>
+    <string>/caminho/NossoPatrimonio/atualizar.py</string>
+    <string>--silencioso</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+  <key>WorkingDirectory</key><string>/caminho/NossoPatrimonio</string>
+</dict>
+</plist>
+```
+
+Carregue com `launchctl load ~/Library/LaunchAgents/com.nossopatrimonio.atualizar.plist`.
+
+## Comparar & Recomendar (informativo)
+
+A aba **📈 Comparar & Recomendar** compara cada fundo da carteira com a
+**mediana da sua classe CVM** em janelas de 6, 12 e 24 meses. Um fundo é
+sinalizado como baixo desempenho quando fica **abaixo da mediana em 2 das 3
+janelas**; nesse caso o app sugere fundos da mesma classe com desempenho
+consistente acima da mediana. Volatilidade e Sharpe entram como informação
+complementar (calculados só para os fundos da carteira).
+
+O conteúdo é **estritamente informativo** — não é recomendação de investimento.
+O universo de pares é construído a partir do Informe Diário (arquivos grandes),
+então essa reconstrução é uma rotina de lote (botão na aba ou `atualizar.py
+--universo`), com resultado cacheado em `pares_classe`/`universo_retornos`.
+
+## Testes
+
+```bash
+pytest
+```
+
+Cobrem os parsers (extrato de movimentações, helpers da planilha e do Informe
+Diário) e a lógica de comparação/recomendação — todos sem rede (fixtures
+sintéticas).
 
 ## Princípios inegociáveis
 

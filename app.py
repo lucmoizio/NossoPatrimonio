@@ -32,11 +32,13 @@ from patrimonio import (
     consultor,
     cvm,
     database,
+    fundos,
     importador_movimentacoes_xp,
     importador_xp,
     importador_xp_planilha,
     mercado,
     projecao,
+    recomendacao,
     relatorios,
     simulador,
 )
@@ -1337,12 +1339,141 @@ def aba_importar() -> None:
 # --------------------------------------------------------------------------- #
 # Roteador principal
 # --------------------------------------------------------------------------- #
+def _pct_txt(fracao: float | None) -> str:
+    """Fração decimal → '12,3%' (ou '—')."""
+    if fracao is None:
+        return "—"
+    return f"{fracao * 100:.1f}%".replace(".", ",")
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Comparar & Recomendar
+# --------------------------------------------------------------------------- #
+def aba_recomendar(titular_id: int | None) -> None:
+    st.header("📈 Comparar & Recomendar")
+    st.info(
+        "Conteúdo **informativo**, não é recomendação de investimento. Compara "
+        "cada fundo com a **mediana da sua classe CVM** em 6/12/24 meses (dados "
+        "oficiais da CVM). Um fundo é sinalizado quando fica **abaixo da mediana "
+        "em 2 das 3 janelas**."
+    )
+
+    data_ref = database.data_ref_universo()
+    n_cad = database.contar_fundos_cadastro()
+    col1, col2 = st.columns(2)
+    col1.metric("Universo de pares", data_br(data_ref) if data_ref else "não construído")
+    col2.metric("Fundos no cadastro CVM", f"{n_cad:,}".replace(",", "."))
+
+    with st.expander("🔄 Atualizar dados de comparação (CVM)", expanded=not data_ref):
+        st.caption(
+            "Sincroniza o cadastro de classes + as cotas dos fundos da carteira e "
+            "reconstrói o universo de pares por classe. Lê arquivos grandes da CVM — "
+            "pode levar alguns minutos na primeira vez."
+        )
+        sync_cad = st.checkbox("Também atualizar o cadastro de classes (mais lento)", value=n_cad == 0)
+        if st.button("Atualizar universo agora", type="primary"):
+            try:
+                if sync_cad:
+                    with st.spinner("Sincronizando cadastro de fundos da CVM..."):
+                        cadastro_cvm.sincronizar_cadastro_fundos()
+                cnpjs = [
+                    "".join(ch for ch in str(a["cnpj"] or "") if ch.isdigit())
+                    for a in database.listar_ativos(apenas_ativos=True)
+                    if a["cnpj"]
+                ]
+                cnpjs = [c for c in cnpjs if len(c) == 14]
+                if cnpjs:
+                    with st.spinner(f"Sincronizando cotas de {len(cnpjs)} fundos..."):
+                        fundos.sincronizar_cotas(cnpjs)
+                with st.spinner("Construindo universo de pares por classe..."):
+                    resumo = recomendacao.estatisticas_classe()
+                st.session_state.pop("aval_carteira", None)
+                st.cache_data.clear()
+                if resumo.get("janelas"):
+                    st.success(f"Universo atualizado (ref. {data_br(resumo['data_ref'])}).")
+                else:
+                    st.warning(
+                        "Não foi possível construir o universo agora "
+                        f"({resumo.get('erro', 'sem dados')}). Tente mais tarde."
+                    )
+                st.rerun()
+            except Exception as exc:  # rede/CVM: degrada com clareza
+                st.error(f"Falha ao atualizar: {exc}")
+
+    st.divider()
+    if st.button("Avaliar carteira") or "aval_carteira" in st.session_state:
+        with st.spinner("Avaliando fundos contra a classe..."):
+            avals = st.session_state.get("aval_carteira")
+            if avals is None or st.session_state.get("aval_titular") != titular_id:
+                avals = recomendacao.avaliar_carteira(titular_id)
+                st.session_state["aval_carteira"] = avals
+                st.session_state["aval_titular"] = titular_id
+    else:
+        st.caption("Clique em **Avaliar carteira** para comparar seus fundos com os pares.")
+        return
+
+    if not avals:
+        st.info("Nenhum fundo com CNPJ na carteira deste titular.")
+        return
+
+    n_baixo = sum(1 for a in avals if a.baixo_desempenho)
+    montante_baixo = sum(a.valor_aplicado for a in avals if a.baixo_desempenho)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fundos avaliados", str(len(avals)))
+    c2.metric("🔴 Baixo desempenho", str(n_baixo))
+    c3.metric("Montante sinalizado", brl(montante_baixo))
+
+    for a in avals:
+        icone = "🔴" if a.baixo_desempenho else "🟢"
+        titulo = f"{icone} {a.nome}"
+        with st.expander(titulo, expanded=a.baixo_desempenho):
+            st.caption(f"Classe CVM: {a.classe or '—'} · Aplicado: {brl(a.valor_aplicado)}")
+            linhas = [
+                {
+                    "Janela": f"{d.janela}m",
+                    "Retorno do fundo": _pct_txt(d.retorno),
+                    "Mediana da classe": _pct_txt(d.mediana_classe),
+                    "Situação": "abaixo" if d.abaixo else ("acima" if (d.retorno is not None and d.mediana_classe is not None) else "—"),
+                }
+                for d in a.janelas
+            ]
+            st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+
+            risco = []
+            if a.vol_anual is not None:
+                risco.append(f"Volatilidade anual ≈ {_pct_txt(a.vol_anual)}")
+            if a.sharpe is not None:
+                risco.append(f"Sharpe ≈ {a.sharpe:.2f}")
+            if risco:
+                st.caption("Risco (complementar): " + " · ".join(risco))
+            if a.obs:
+                st.caption(f"ℹ️ {a.obs}")
+
+            if a.baixo_desempenho and a.alternativas:
+                st.markdown("**Alternativas da mesma classe (acima da mediana em ≥2 janelas):**")
+                alt_linhas = []
+                for alt in a.alternativas:
+                    linha = {"Fundo": alt.denominacao, "CNPJ": cadastro_cvm.formatar_cnpj(alt.cnpj)}
+                    for j in recomendacao.JANELAS_PADRAO:
+                        linha[f"{j}m"] = _pct_txt(alt.retornos.get(j))
+                    alt_linhas.append(linha)
+                st.dataframe(pd.DataFrame(alt_linhas), hide_index=True, use_container_width=True)
+                st.caption(
+                    "Sugestões informativas por desempenho relativo. Confira taxa de "
+                    "administração, liquidez, risco e adequação ao seu perfil antes de "
+                    "qualquer decisão. Não é recomendação de investimento."
+                )
+            elif a.baixo_desempenho:
+                st.caption("Sem alternativas com desempenho consistente acima da mediana no momento.")
+
+
 def main() -> None:
     titular_id = render_sidebar()
     abas = st.tabs(
         [
             "📊 Painel",
             "🔔 Alertas",
+            "📈 Comparar & Recomendar",
             "📋 Ativos",
             "📥 Importar extrato",
             "📝 Atualizar valores",
@@ -1357,18 +1488,20 @@ def main() -> None:
     with abas[1]:
         aba_alertas(titular_id)
     with abas[2]:
-        aba_ativos(titular_id)
+        aba_recomendar(titular_id)
     with abas[3]:
-        aba_importar()
+        aba_ativos(titular_id)
     with abas[4]:
-        aba_atualizar(titular_id)
+        aba_importar()
     with abas[5]:
-        aba_metas(titular_id)
+        aba_atualizar(titular_id)
     with abas[6]:
-        aba_consultor(titular_id)
+        aba_metas(titular_id)
     with abas[7]:
-        aba_simulador()
+        aba_consultor(titular_id)
     with abas[8]:
+        aba_simulador()
+    with abas[9]:
         aba_proventos_ir(titular_id)
 
 

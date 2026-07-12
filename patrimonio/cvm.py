@@ -32,6 +32,8 @@ from typing import Optional
 
 import requests
 
+from . import database
+
 _URL_INFORME = (
     "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{aaaamm}.zip"
 )
@@ -42,6 +44,8 @@ _TIMEOUT = 60
 _COLS_CNPJ = ("CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO")
 _COL_DATA = "DT_COMPTC"
 _COL_COTA = "VL_QUOTA"
+_COL_PL = "VL_PATRIM_LIQ"
+_COL_COTISTAS = "NR_COTST"
 
 
 class ErroDadosCVM(RuntimeError):
@@ -127,6 +131,128 @@ def _ler_cotas_do_mes(aaaamm: str, cnpj_alvo: str) -> dict[str, float]:
     return cotas
 
 
+def _num_opt(texto: str) -> Optional[float]:
+    """Converte um número CVM ('1234.56' ou '1234,56') em float, ou None."""
+    s = (texto or "").strip()
+    if not s:
+        return None
+    try:
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _int_opt(texto: str) -> Optional[int]:
+    v = _num_opt(texto)
+    return int(v) if v is not None else None
+
+
+def _serie_mes_fundo(aaaamm: str, cnpj_alvo: str) -> dict[str, dict]:
+    """{data_iso: {'cota','pl','cotistas'}} do fundo no mês `aaaamm`."""
+    conteudo = _baixar_informe(aaaamm)
+    alvo = _so_digitos(cnpj_alvo)
+    saida: dict[str, dict] = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+            for nome in (n for n in zf.namelist() if n.lower().endswith(".csv")):
+                with zf.open(nome) as bruto:
+                    texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                    leitor = csv.DictReader(texto, delimiter=";")
+                    col_cnpj = next(
+                        (c for c in _COLS_CNPJ if c in (leitor.fieldnames or [])), None
+                    )
+                    if col_cnpj is None:
+                        continue
+                    for linha in leitor:
+                        if _so_digitos(linha.get(col_cnpj, "")) != alvo:
+                            continue
+                        data_str = (linha.get(_COL_DATA) or "").strip()
+                        cota = _num_opt(linha.get(_COL_COTA, ""))
+                        if not data_str or cota is None:
+                            continue
+                        saida[data_str] = {
+                            "cota": cota,
+                            "pl": _num_opt(linha.get(_COL_PL, "")),
+                            "cotistas": _int_opt(linha.get(_COL_COTISTAS, "")),
+                        }
+    except zipfile.BadZipFile as exc:
+        raise ErroDadosCVM(
+            f"Arquivo da CVM de {aaaamm} corrompido/inválido: {exc}"
+        ) from exc
+    return saida
+
+
+def universo_cotas_mes(aaaamm: str, data_limite: str) -> dict[str, float]:
+    """Cota do último pregão <= `data_limite` de TODOS os fundos no mês `aaaamm`.
+
+    Faz uma única passada no CSV mensal (grande), acumulando por CNPJ a cota do
+    pregão mais recente que não ultrapasse `data_limite`. Base do universo de
+    pares (mediana por classe). Retorna {cnpj_normalizado: cota}.
+    """
+    conteudo = _baixar_informe(aaaamm)
+    limite = datetime.fromisoformat(data_limite).date()
+    melhor_data: dict[str, str] = {}
+    cotas: dict[str, float] = {}
+    with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+        for nome in (n for n in zf.namelist() if n.lower().endswith(".csv")):
+            with zf.open(nome) as bruto:
+                texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                leitor = csv.DictReader(texto, delimiter=";")
+                col_cnpj = next(
+                    (c for c in _COLS_CNPJ if c in (leitor.fieldnames or [])), None
+                )
+                if col_cnpj is None:
+                    continue
+                for linha in leitor:
+                    data_str = (linha.get(_COL_DATA) or "").strip()
+                    if not data_str:
+                        continue
+                    try:
+                        if datetime.fromisoformat(data_str).date() > limite:
+                            continue
+                    except ValueError:
+                        continue
+                    cnpj = _so_digitos(linha.get(col_cnpj, ""))
+                    if not cnpj:
+                        continue
+                    if cnpj not in melhor_data or data_str > melhor_data[cnpj]:
+                        cota = _num_opt(linha.get(_COL_COTA, ""))
+                        if cota is None or cota <= 0:
+                            continue
+                        melhor_data[cnpj] = data_str
+                        cotas[cnpj] = cota
+    return cotas
+
+
+def serie_cotas_fundo(
+    cnpj: str, data_ini: str, data_fim: Optional[str] = None
+) -> list[dict]:
+    """Série [{'data','cota','pl','cotistas'}] do fundo no intervalo [ini, fim].
+
+    Lê os Informes Diários mês a mês. `data_ini`/`data_fim` em ISO. Ordena por
+    data crescente. Fundos fora do Informe FIF (ex.: FIDC) retornam lista vazia.
+    """
+    ini = datetime.fromisoformat(data_ini).date()
+    fim = datetime.fromisoformat(data_fim).date() if data_fim else date.today()
+    if ini > fim:
+        return []
+    pontos: list[dict] = []
+    for aaaamm in _meses_entre(ini, fim):
+        try:
+            mes = _serie_mes_fundo(aaaamm, cnpj)
+        except ErroDadosCVM:
+            continue
+        for data_str, info in mes.items():
+            try:
+                d = datetime.fromisoformat(data_str).date()
+            except ValueError:
+                continue
+            if ini <= d <= fim:
+                pontos.append({"data": data_str, **info})
+    pontos.sort(key=lambda p: p["data"])
+    return pontos
+
+
 def _meses_entre(inicio: date, fim: date) -> list[str]:
     """Lista de 'AAAAMM' de `inicio` a `fim` inclusive."""
     meses: list[str] = []
@@ -146,7 +272,38 @@ def cota_na_data(cnpj: str, data_ref: str) -> Optional[tuple[str, float]]:
     Procura no mês da data e retrocede até 3 meses para achar o último pregão
     disponível igual ou anterior à data solicitada.
     """
+# Gap máximo (dias) para confiar num ponto do cache como "o pregão mais próximo".
+# Evita devolver uma cota antiga quando o cache local está esparso naquela data.
+_GAP_CACHE_DIAS = 8
+
+
+def _guardar_cotas_cache(cnpj: str, cotas: dict[str, float]) -> None:
+    """Grava (best-effort) no cache em banco as cotas lidas do ZIP."""
+    if not cotas:
+        return
+    try:
+        database.gravar_cotas_fundo(
+            cnpj, [{"data": d, "cota": c} for d, c in cotas.items()]
+        )
+    except Exception:
+        pass  # cache é best-effort; nunca deve quebrar a leitura
+
+
+def cota_na_data(cnpj: str, data_ref: str) -> Optional[tuple[str, float]]:
+    """Cota do fundo no pregão <= `data_ref` (ISO). Retorna (data, cota) ou None.
+
+    Consulta primeiro o cache local (`cotas_fundos`); se houver um ponto próximo
+    (<= _GAP_CACHE_DIAS), usa-o. Caso contrário lê o Informe Diário (mês da data
+    e até 3 meses atrás), gravando o resultado no cache.
+    """
     alvo = datetime.fromisoformat(data_ref).date()
+
+    cache = database.cota_fundo_em(cnpj, data_ref)
+    if cache is not None:
+        d_cache = datetime.fromisoformat(cache["data"]).date()
+        if 0 <= (alvo - d_cache).days <= _GAP_CACHE_DIAS:
+            return cache["data"], float(cache["cota"])
+
     for recuo in range(0, 4):
         ano = alvo.year
         mes = alvo.month - recuo
@@ -158,6 +315,7 @@ def cota_na_data(cnpj: str, data_ref: str) -> Optional[tuple[str, float]]:
             cotas = _ler_cotas_do_mes(aaaamm, cnpj)
         except ErroDadosCVM:
             continue
+        _guardar_cotas_cache(cnpj, cotas)
         candidatos = {
             d: c for d, c in cotas.items()
             if datetime.fromisoformat(d).date() <= alvo
@@ -169,8 +327,19 @@ def cota_na_data(cnpj: str, data_ref: str) -> Optional[tuple[str, float]]:
 
 
 def cota_mais_recente(cnpj: str) -> Optional[tuple[str, float]]:
-    """Cota mais recente disponível do fundo (busca mês corrente e anteriores)."""
+    """Cota mais recente disponível do fundo (busca mês corrente e anteriores).
+
+    Usa o cache local se ele estiver fresco (última data <= _GAP_CACHE_DIAS);
+    senão lê o Informe Diário e atualiza o cache.
+    """
     hoje = date.today()
+
+    cache = database.cota_fundo_recente(cnpj)
+    if cache is not None:
+        d_cache = datetime.fromisoformat(cache["data"]).date()
+        if 0 <= (hoje - d_cache).days <= _GAP_CACHE_DIAS:
+            return cache["data"], float(cache["cota"])
+
     for recuo in range(0, 4):
         ano = hoje.year
         mes = hoje.month - recuo
@@ -182,6 +351,7 @@ def cota_mais_recente(cnpj: str) -> Optional[tuple[str, float]]:
             cotas = _ler_cotas_do_mes(aaaamm, cnpj)
         except ErroDadosCVM:
             continue
+        _guardar_cotas_cache(cnpj, cotas)
         if cotas:
             data_mais_recente = max(cotas)
             return data_mais_recente, cotas[data_mais_recente]

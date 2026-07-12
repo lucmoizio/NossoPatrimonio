@@ -144,10 +144,59 @@ def inicializar(caminho: Optional[Path] = None) -> None:
                 custos     REAL NOT NULL DEFAULT 0
             );
 
+            -- Cache de cotas de fundos parseadas do Informe Diário da CVM.
+            -- Evita reprocessar o CSV mensal (grande) a cada consulta e serve de
+            -- base idempotente para o motor de atualização e de recomendação.
+            CREATE TABLE IF NOT EXISTS cotas_fundos (
+                cnpj     TEXT NOT NULL,
+                data     TEXT NOT NULL,
+                cota     REAL NOT NULL,
+                pl       REAL,
+                cotistas INTEGER,
+                fonte    TEXT NOT NULL DEFAULT 'CVM',
+                PRIMARY KEY (cnpj, data)
+            );
+
+            -- Cadastro de classes/fundos da CVM (classe, tipo e taxa de adm) para
+            -- comparação por pares (mediana da classe).
+            CREATE TABLE IF NOT EXISTS fundos_cadastro (
+                cnpj         TEXT PRIMARY KEY,
+                denominacao  TEXT,
+                classe       TEXT,
+                tipo         TEXT,
+                taxa_adm     REAL,
+                situacao     TEXT,
+                atualizado_em TEXT
+            );
+
+            -- Retorno por janela (6/12/24m) de cada fundo do universo, numa data
+            -- de referência. Base para estatísticas de classe e sugestões.
+            CREATE TABLE IF NOT EXISTS universo_retornos (
+                cnpj     TEXT NOT NULL,
+                janela   INTEGER NOT NULL,
+                data_ref TEXT NOT NULL,
+                retorno  REAL NOT NULL,
+                PRIMARY KEY (cnpj, janela, data_ref)
+            );
+
+            -- Estatísticas por classe/janela (mediana e quartis) numa data de ref.
+            CREATE TABLE IF NOT EXISTS pares_classe (
+                classe   TEXT NOT NULL,
+                janela   INTEGER NOT NULL,
+                data_ref TEXT NOT NULL,
+                mediana  REAL NOT NULL,
+                q1       REAL,
+                q3       REAL,
+                n        INTEGER NOT NULL,
+                PRIMARY KEY (classe, janela, data_ref)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_ativos_titular ON ativos(titular_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_ativo ON snapshots(ativo_id);
             CREATE INDEX IF NOT EXISTS idx_movimentos_ativo ON movimentos(ativo_id);
             CREATE INDEX IF NOT EXISTS idx_proventos_ativo ON proventos(ativo_id);
+            CREATE INDEX IF NOT EXISTS idx_cotas_fundos_cnpj ON cotas_fundos(cnpj);
+            CREATE INDEX IF NOT EXISTS idx_universo_classe ON universo_retornos(cnpj);
             """
         )
 
@@ -540,6 +589,307 @@ def limpar_simulador(caminho: Optional[Path] = None) -> None:
     with transacao(caminho) as con:
         con.execute("DELETE FROM sim_ordens")
         con.execute("DELETE FROM sim_config")
+
+
+# --------------------------------------------------------------------------- #
+# Cotas de fundos (cache do Informe Diário da CVM)
+# --------------------------------------------------------------------------- #
+def gravar_cotas_fundo(
+    cnpj: str,
+    cotas: list[dict],
+    fonte: str = "CVM",
+    caminho: Optional[Path] = None,
+) -> int:
+    """Upsert idempotente de cotas de um fundo.
+
+    `cotas` é uma lista de dicts com chaves 'data' (ISO), 'cota' e, opcionalmente,
+    'pl' e 'cotistas'. Retorna o número de linhas processadas.
+    """
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    if not cnpj_norm or not cotas:
+        return 0
+    with transacao(caminho) as con:
+        con.executemany(
+            """
+            INSERT INTO cotas_fundos (cnpj, data, cota, pl, cotistas, fonte)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cnpj, data) DO UPDATE SET
+                cota = excluded.cota,
+                pl = excluded.pl,
+                cotistas = excluded.cotistas,
+                fonte = excluded.fonte
+            """,
+            [
+                (
+                    cnpj_norm,
+                    c["data"],
+                    float(c["cota"]),
+                    c.get("pl"),
+                    c.get("cotistas"),
+                    fonte,
+                )
+                for c in cotas
+                if c.get("data") and c.get("cota") is not None
+            ],
+        )
+    return len(cotas)
+
+
+def ultima_data_cota(cnpj: str, caminho: Optional[Path] = None) -> Optional[str]:
+    """Data (ISO) da cota mais recente já armazenada para o fundo, ou None."""
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    with transacao(caminho) as con:
+        linha = con.execute(
+            "SELECT MAX(data) AS d FROM cotas_fundos WHERE cnpj = ?", (cnpj_norm,)
+        ).fetchone()
+        return linha["d"] if linha and linha["d"] else None
+
+
+def cota_fundo_em(
+    cnpj: str, data_max: str, caminho: Optional[Path] = None
+) -> Optional[sqlite3.Row]:
+    """Cota armazenada no pregão <= `data_max` (ISO). Retorna Row(data, cota) ou None."""
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    with transacao(caminho) as con:
+        return con.execute(
+            "SELECT data, cota FROM cotas_fundos WHERE cnpj = ? AND data <= ? "
+            "ORDER BY data DESC LIMIT 1",
+            (cnpj_norm, data_max),
+        ).fetchone()
+
+
+def cota_fundo_recente(cnpj: str, caminho: Optional[Path] = None) -> Optional[sqlite3.Row]:
+    """Cota armazenada mais recente do fundo. Retorna Row(data, cota) ou None."""
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    with transacao(caminho) as con:
+        return con.execute(
+            "SELECT data, cota FROM cotas_fundos WHERE cnpj = ? "
+            "ORDER BY data DESC LIMIT 1",
+            (cnpj_norm,),
+        ).fetchone()
+
+
+def serie_cotas_fundo(cnpj: str, caminho: Optional[Path] = None) -> list[sqlite3.Row]:
+    """Série completa (data, cota) armazenada do fundo, em ordem cronológica."""
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    with transacao(caminho) as con:
+        return con.execute(
+            "SELECT data, cota FROM cotas_fundos WHERE cnpj = ? ORDER BY data",
+            (cnpj_norm,),
+        ).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Cadastro de fundos da CVM (classe/tipo/taxa)
+# --------------------------------------------------------------------------- #
+def upsert_fundos_cadastro(registros: list[dict], caminho: Optional[Path] = None) -> int:
+    """Upsert de registros de cadastro de fundos.
+
+    Cada dict deve ter 'cnpj' e, opcionalmente, 'denominacao', 'classe', 'tipo',
+    'taxa_adm', 'situacao', 'atualizado_em'. Retorna o número de linhas gravadas.
+    """
+    linhas = []
+    for r in registros:
+        cnpj_norm = "".join(ch for ch in str(r.get("cnpj", "")) if ch.isdigit())
+        if not cnpj_norm:
+            continue
+        linhas.append(
+            (
+                cnpj_norm,
+                r.get("denominacao"),
+                r.get("classe"),
+                r.get("tipo"),
+                r.get("taxa_adm"),
+                r.get("situacao"),
+                r.get("atualizado_em") or date.today().isoformat(),
+            )
+        )
+    if not linhas:
+        return 0
+    with transacao(caminho) as con:
+        con.executemany(
+            """
+            INSERT INTO fundos_cadastro
+                (cnpj, denominacao, classe, tipo, taxa_adm, situacao, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cnpj) DO UPDATE SET
+                denominacao = excluded.denominacao,
+                classe = excluded.classe,
+                tipo = excluded.tipo,
+                taxa_adm = excluded.taxa_adm,
+                situacao = excluded.situacao,
+                atualizado_em = excluded.atualizado_em
+            """,
+            linhas,
+        )
+    return len(linhas)
+
+
+def obter_fundo_cadastro(cnpj: str, caminho: Optional[Path] = None) -> Optional[sqlite3.Row]:
+    cnpj_norm = "".join(ch for ch in str(cnpj) if ch.isdigit())
+    with transacao(caminho) as con:
+        return con.execute(
+            "SELECT * FROM fundos_cadastro WHERE cnpj = ?", (cnpj_norm,)
+        ).fetchone()
+
+
+def contar_fundos_cadastro(caminho: Optional[Path] = None) -> int:
+    with transacao(caminho) as con:
+        return int(con.execute("SELECT COUNT(*) AS c FROM fundos_cadastro").fetchone()["c"])
+
+
+# --------------------------------------------------------------------------- #
+# Universo de retornos e estatísticas por classe (motor de recomendação)
+# --------------------------------------------------------------------------- #
+def gravar_universo_retornos(
+    registros: list[dict], caminho: Optional[Path] = None
+) -> int:
+    """Upsert de retornos do universo. Cada dict: cnpj, janela, data_ref, retorno."""
+    linhas = []
+    for r in registros:
+        cnpj_norm = "".join(ch for ch in str(r.get("cnpj", "")) if ch.isdigit())
+        if not cnpj_norm or r.get("retorno") is None:
+            continue
+        linhas.append(
+            (cnpj_norm, int(r["janela"]), r["data_ref"], float(r["retorno"]))
+        )
+    if not linhas:
+        return 0
+    with transacao(caminho) as con:
+        con.executemany(
+            """
+            INSERT INTO universo_retornos (cnpj, janela, data_ref, retorno)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(cnpj, janela, data_ref) DO UPDATE SET retorno = excluded.retorno
+            """,
+            linhas,
+        )
+    return len(linhas)
+
+
+def gravar_pares_classe(registros: list[dict], caminho: Optional[Path] = None) -> int:
+    """Upsert de estatísticas por classe. Cada dict: classe, janela, data_ref,
+    mediana, q1, q3, n."""
+    linhas = [
+        (
+            r["classe"],
+            int(r["janela"]),
+            r["data_ref"],
+            float(r["mediana"]),
+            r.get("q1"),
+            r.get("q3"),
+            int(r["n"]),
+        )
+        for r in registros
+        if r.get("classe") and r.get("mediana") is not None
+    ]
+    if not linhas:
+        return 0
+    with transacao(caminho) as con:
+        con.executemany(
+            """
+            INSERT INTO pares_classe (classe, janela, data_ref, mediana, q1, q3, n)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(classe, janela, data_ref) DO UPDATE SET
+                mediana = excluded.mediana, q1 = excluded.q1,
+                q3 = excluded.q3, n = excluded.n
+            """,
+            linhas,
+        )
+    return len(linhas)
+
+
+def obter_pares_classe(
+    classe: str, janela: int, data_ref: Optional[str] = None, caminho: Optional[Path] = None
+) -> Optional[sqlite3.Row]:
+    """Estatísticas de uma classe/janela (a data_ref mais recente, se não informada)."""
+    with transacao(caminho) as con:
+        if data_ref:
+            return con.execute(
+                "SELECT * FROM pares_classe WHERE classe = ? AND janela = ? AND data_ref = ?",
+                (classe, janela, data_ref),
+            ).fetchone()
+        return con.execute(
+            "SELECT * FROM pares_classe WHERE classe = ? AND janela = ? "
+            "ORDER BY data_ref DESC LIMIT 1",
+            (classe, janela),
+        ).fetchone()
+
+
+def melhores_da_classe(
+    classe: str,
+    janela: int,
+    retorno_minimo: float,
+    data_ref: Optional[str] = None,
+    limite: int = 50,
+    caminho: Optional[Path] = None,
+) -> list[sqlite3.Row]:
+    """Fundos de uma classe/janela com retorno >= `retorno_minimo`, com dados de
+    cadastro (denominação, taxa). Usado para sugerir alternativas."""
+    with transacao(caminho) as con:
+        if data_ref is None:
+            linha = con.execute(
+                "SELECT MAX(data_ref) AS d FROM universo_retornos WHERE janela = ?",
+                (janela,),
+            ).fetchone()
+            data_ref = linha["d"] if linha else None
+        if data_ref is None:
+            return []
+        return con.execute(
+            """
+            SELECT u.cnpj, u.retorno, f.denominacao, f.taxa_adm, f.classe
+            FROM universo_retornos u
+            JOIN fundos_cadastro f ON f.cnpj = u.cnpj
+            WHERE u.janela = ? AND u.data_ref = ? AND f.classe = ? AND u.retorno >= ?
+            ORDER BY u.retorno DESC
+            LIMIT ?
+            """,
+            (janela, data_ref, classe, retorno_minimo, limite),
+        ).fetchall()
+
+
+def retornos_por_classe(
+    classe: str, data_ref: Optional[str] = None, caminho: Optional[Path] = None
+) -> list[sqlite3.Row]:
+    """Todos os retornos (por CNPJ e janela) de uma classe numa data de ref.
+
+    Retorna linhas (cnpj, janela, retorno, denominacao, taxa_adm). Usado para
+    achar fundos acima da mediana em >= 2 janelas (sugestão de alternativas).
+    """
+    with transacao(caminho) as con:
+        if data_ref is None:
+            linha = con.execute(
+                "SELECT MAX(data_ref) AS d FROM universo_retornos"
+            ).fetchone()
+            data_ref = linha["d"] if linha else None
+        if data_ref is None:
+            return []
+        return con.execute(
+            """
+            SELECT u.cnpj, u.janela, u.retorno, f.denominacao, f.taxa_adm
+            FROM universo_retornos u
+            JOIN fundos_cadastro f ON f.cnpj = u.cnpj
+            WHERE f.classe = ? AND u.data_ref = ?
+            ORDER BY u.cnpj, u.janela
+            """,
+            (classe, data_ref),
+        ).fetchall()
+
+
+def todas_classes(caminho: Optional[Path] = None) -> list[sqlite3.Row]:
+    """(cnpj, classe) de todos os fundos com classe conhecida (para agregação)."""
+    with transacao(caminho) as con:
+        return con.execute(
+            "SELECT cnpj, classe FROM fundos_cadastro "
+            "WHERE classe IS NOT NULL AND classe <> ''"
+        ).fetchall()
+
+
+def data_ref_universo(caminho: Optional[Path] = None) -> Optional[str]:
+    """Data de referência mais recente já computada no universo de retornos."""
+    with transacao(caminho) as con:
+        linha = con.execute("SELECT MAX(data_ref) AS d FROM universo_retornos").fetchone()
+        return linha["d"] if linha and linha["d"] else None
 
 
 if __name__ == "__main__":  # smoke manual

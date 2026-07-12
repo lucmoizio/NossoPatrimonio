@@ -28,7 +28,7 @@ from typing import Optional
 
 import requests
 
-from . import cvm
+from . import cvm, database
 
 _URL_CADASTRO = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
 _DIR_CACHE = Path(__file__).resolve().parent.parent / ".cache_cvm"
@@ -331,6 +331,73 @@ def resolver_carteira(posicoes: list, data_ref: str) -> list[ResultadoCNPJ]:
             res.status = "fidc" if "FIDC" in nm else "candidato"
 
     return resultados
+
+
+# --------------------------------------------------------------------------- #
+# Sincronização do cadastro (classe/tipo) para comparação por pares
+# --------------------------------------------------------------------------- #
+def _classe_de(linha: dict) -> str:
+    """Classe/categoria de comparação: ANBIMA > Classificação CVM > Tipo_Classe.
+
+    O cadastro da CVM não traz taxa de administração; por isso `taxa_adm` fica
+    None (limitação oficial documentada no README).
+    """
+    for col in ("Classificacao_Anbima", "Classificacao", "Tipo_Classe"):
+        valor = (linha.get(col) or "").strip()
+        if valor:
+            return valor
+    return ""
+
+
+def sincronizar_cadastro_fundos(caminho=None) -> int:
+    """Popula `fundos_cadastro` (cnpj, denominação, classe, tipo, situação).
+
+    Lê `registro_classe.csv` (CNPJ_Classe, mesmo id do Informe Diário) e usa
+    `registro_fundo.csv` (CNPJ_Fundo/Tipo_Fundo) como complemento. Retorna o
+    número de registros gravados. Fonte oficial e gratuita (CVM).
+    """
+    conteudo = _baixar_cadastro()
+    registros: list[dict] = []
+    with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+        nomes = zf.namelist()
+        # Complemento primeiro (será sobrescrito pela classe quando o CNPJ coincidir).
+        if "registro_fundo.csv" in nomes:
+            with zf.open("registro_fundo.csv") as bruto:
+                texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                for linha in csv.DictReader(texto, delimiter=";"):
+                    cnpj = re.sub(r"\D", "", linha.get("CNPJ_Fundo", "") or "")
+                    if not cnpj:
+                        continue
+                    tipo = (linha.get("Tipo_Fundo") or "").strip()
+                    registros.append(
+                        {
+                            "cnpj": cnpj,
+                            "denominacao": (linha.get("Denominacao_Social") or "").strip(),
+                            "classe": tipo,
+                            "tipo": tipo,
+                            "taxa_adm": None,
+                            "situacao": (linha.get("Situacao") or "").strip(),
+                        }
+                    )
+        # Primário: classes (CNPJ_Classe é o CNPJ que aparece no Informe Diário).
+        if "registro_classe.csv" in nomes:
+            with zf.open("registro_classe.csv") as bruto:
+                texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                for linha in csv.DictReader(texto, delimiter=";"):
+                    cnpj = re.sub(r"\D", "", linha.get("CNPJ_Classe", "") or "")
+                    if not cnpj:
+                        continue
+                    registros.append(
+                        {
+                            "cnpj": cnpj,
+                            "denominacao": (linha.get("Denominacao_Social") or "").strip(),
+                            "classe": _classe_de(linha),
+                            "tipo": (linha.get("Tipo_Classe") or "").strip(),
+                            "taxa_adm": None,
+                            "situacao": (linha.get("Situacao") or "").strip(),
+                        }
+                    )
+    return database.upsert_fundos_cadastro(registros, caminho=caminho)
 
 
 def formatar_cnpj(cnpj: Optional[str]) -> Optional[str]:
