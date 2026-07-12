@@ -226,6 +226,22 @@ def _salvar_validado(nome: str, cnpj: str, denominacao: Optional[str]) -> None:
         pass  # cache é best-effort
 
 
+def limpar_cache_validados() -> int:
+    """Apaga o cache local de CNPJs validados por cota (reimportação limpa).
+
+    Chamado pelo reset da plataforma junto com `database.zerar_dados`.
+    Retorna quantas entradas havia no cache.
+    """
+    if not _ARQ_VALIDADOS.exists():
+        return 0
+    try:
+        n = len(_carregar_validados())
+        _ARQ_VALIDADOS.unlink()
+        return n
+    except OSError:
+        return 0
+
+
 def _tem_cnpj_proprio(nome: str, categoria: str) -> bool:
     """Heurística: o ativo é um fundo (tem CNPJ na CVM) ou renda fixa bancária?"""
     cat = categoria.upper()

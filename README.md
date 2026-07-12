@@ -173,6 +173,11 @@ Cobrem os parsers (extrato de movimentações, helpers da planilha e do Informe
 Diário) e a lógica de comparação/recomendação — todos sem rede (fixtures
 sintéticas).
 
+**Reset da plataforma:** ao adicionar nova persistência ligada à carteira ou ao
+motor de fundos, inclua a tabela em `_TABELAS_ZERAR_*` em `database.py` e, se
+houver cache em arquivo, limpe-o em `app.py` (`_sidebar_zerar_dados`). O
+cadastro oficial `fundos_cadastro` (referência CVM) é preservado de propósito.
+
 ## Princípios inegociáveis
 
 1. Nenhum dado inventado — só fontes oficiais (BCB, CVM).

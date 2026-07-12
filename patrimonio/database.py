@@ -234,6 +234,16 @@ def id_titular(nome: str, caminho: Optional[Path] = None) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # Reset (zerar dados)
 # --------------------------------------------------------------------------- #
+# Tabelas apagadas pelo "Zerar dados". Ao adicionar persistência nova ligada à
+# carteira ou ao motor de fundos, inclua a tabela aqui — senão o reset fica incompleto.
+# `fundos_cadastro` fica de fora: é cadastro oficial da CVM (referência), não dado
+# do usuário; rebaixá-lo forçaria re-sync pesado sem benefício para reimportar.
+_TABELAS_ZERAR_CARTEIRA = ("proventos", "movimentos", "snapshots", "ativos")
+_TABELAS_ZERAR_MOTOR = ("cotas_fundos", "universo_retornos", "pares_classe")
+_TABELAS_ZERAR_METAS = ("metas",)
+_TABELAS_ZERAR_SIMULADOR = ("sim_ordens", "sim_config")
+
+
 def zerar_dados(
     caminho: Optional[Path] = None,
     *,
@@ -242,15 +252,16 @@ def zerar_dados(
 ) -> dict[str, int]:
     """Apaga os dados do usuário e retorna quantas linhas foram removidas.
 
-    Sempre limpa carteira (ativos, snapshots, movimentos, proventos). Metas e
+    Sempre limpa carteira (ativos, snapshots, movimentos, proventos) e o cache
+    do motor de fundos (cotas sincronizadas, universo de pares). Metas e
     simulador são opcionais. Os titulares fixos são preservados (e regarantidos).
     Operação irreversível — a UI exige confirmação explícita.
     """
-    tabelas = ["proventos", "movimentos", "snapshots", "ativos"]
+    tabelas = list(_TABELAS_ZERAR_CARTEIRA) + list(_TABELAS_ZERAR_MOTOR)
     if incluir_metas:
-        tabelas.append("metas")
+        tabelas.extend(_TABELAS_ZERAR_METAS)
     if incluir_simulador:
-        tabelas += ["sim_ordens", "sim_config"]
+        tabelas.extend(_TABELAS_ZERAR_SIMULADOR)
 
     removidos: dict[str, int] = {}
     with transacao(caminho) as con:

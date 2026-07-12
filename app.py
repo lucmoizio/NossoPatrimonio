@@ -156,13 +156,26 @@ def render_sidebar() -> int | None:
     return titular_id
 
 
+# Chaves de session_state ligadas à carteira — limpar no reset da plataforma.
+_ESTADOS_ZERAR = (
+    "import_estado",
+    "aval_carteira",
+    "aval_titular",
+    "estimativa_datas",
+    "mov_estado",
+    "ia_alertas",
+)
+
+
 def _sidebar_zerar_dados() -> None:
     """Seção de reset: apaga os dados da plataforma após dupla confirmação."""
     with st.sidebar.expander("⚠️ Zerar dados", expanded=False):
         st.caption(
             "Apaga toda a carteira (ativos, snapshots, aportes/resgates e "
-            "proventos) para recomeçar as importações do zero. Os titulares "
-            "são mantidos. Ação irreversível."
+            "proventos), o cache de cotas/universo de fundos e os CNPJs "
+            "validados em importações anteriores — para recomeçar do zero. "
+            "Os titulares e o cadastro oficial de classes da CVM são mantidos. "
+            "Ação irreversível."
         )
         incluir_metas = st.checkbox("Apagar também metas", value=True, key="zerar_metas")
         incluir_sim = st.checkbox("Apagar também simulador", value=True, key="zerar_sim")
@@ -175,9 +188,13 @@ def _sidebar_zerar_dados() -> None:
             removidos = database.zerar_dados(
                 incluir_metas=incluir_metas, incluir_simulador=incluir_sim
             )
+            cache_cnpj = cadastro_cvm.limpar_cache_validados()
+            if cache_cnpj:
+                removidos["cnpj_validados"] = cache_cnpj
             total = sum(removidos.values())
-            # Limpa estados de importação e caches em memória.
-            st.session_state.pop("import_estado", None)
+            # Limpa estados de importação, recomendação e caches em memória.
+            for chave in _ESTADOS_ZERAR:
+                st.session_state.pop(chave, None)
             st.cache_data.clear()
             st.success(
                 f"Dados zerados: {total} registros removidos "
