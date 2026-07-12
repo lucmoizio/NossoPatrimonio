@@ -136,3 +136,68 @@ def perguntar(
         buscas_realizadas=buscas,
         modelo=modelo_atual(),
     )
+
+
+def _fmt_pct(fracao: Optional[float]) -> str:
+    return "—" if fracao is None else f"{fracao * 100:.1f}%".replace(".", ",")
+
+
+def _fmt_brl(valor: Optional[float]) -> str:
+    if valor is None:
+        return "—"
+    s = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+
+def analisar_alertas(
+    ativos_em_alerta: list[dict], contexto_carteira: Optional[str] = None
+) -> RespostaConsultor:
+    """Aprofunda os alertas da carteira via IA, priorizando pelo montante.
+
+    Cada item de `ativos_em_alerta` deve conter: nome, categoria, titular,
+    valor_aplicado, valor_atual, pct_carteira, rent_bruta, pct_cdi, rent_real,
+    taxa_adm_aa (opcional) e alertas (lista de strings). Reaproveita o system
+    prompt e a busca web de `perguntar`.
+    """
+    if not ativos_em_alerta:
+        raise RuntimeError("Nenhum ativo em alerta para analisar.")
+
+    ordenados = sorted(
+        ativos_em_alerta, key=lambda it: it.get("valor_aplicado") or 0.0, reverse=True
+    )
+    blocos: list[str] = []
+    for i, it in enumerate(ordenados, start=1):
+        taxa = it.get("taxa_adm_aa")
+        blocos.append(
+            "\n".join(
+                [
+                    f"{i}. {it['nome']} ({it.get('titular', '—')}) — {it['categoria']}",
+                    f"   Montante aplicado: {_fmt_brl(it.get('valor_aplicado'))} | "
+                    f"Valor atual: {_fmt_brl(it.get('valor_atual'))} | "
+                    f"{_fmt_pct(it.get('pct_carteira'))} da carteira",
+                    f"   Rent. bruta: {_fmt_pct(it.get('rent_bruta'))} | "
+                    f"% do CDI: {_fmt_pct(it.get('pct_cdi'))} | "
+                    f"Rent. real: {_fmt_pct(it.get('rent_real'))}"
+                    + (f" | Taxa adm: {taxa:.2f}% a.a." if taxa else ""),
+                    "   Alertas: " + "; ".join(it.get("alertas", [])),
+                ]
+            )
+        )
+
+    pergunta = (
+        "Abaixo estão os ativos da carteira que dispararam alertas (já ordenados "
+        "por montante investido, do maior para o menor). Para CADA ativo, produza "
+        "uma análise aprofundada contendo:\n"
+        "1) Por que o alerta faz sentido (explique o motivo com clareza);\n"
+        "2) O risco ou custo concreto de manter a posição como está;\n"
+        "3) A direção recomendada quanto ao MONTANTE investido — manter, reduzir "
+        "ou realocar, e para qual tipo de aplicação —, sempre comparando com o CDI "
+        "líquido do prazo equivalente e considerando IR, come-cotas e liquidez.\n\n"
+        "Busque taxas atuais em fontes oficiais quando precisar. Use subtítulos com "
+        "o nome de cada ativo. Ao final, entregue um PLANO DE AÇÃO priorizado (na "
+        "ordem em que aparecem, maiores montantes primeiro), indicando quanto "
+        "realocar de cada um. Encerre com a ressalva de que não substitui um "
+        "assessor certificado pela CVM.\n\n"
+        "Ativos em alerta:\n" + "\n\n".join(blocos)
+    )
+    return perguntar(pergunta, contexto_carteira=contexto_carteira)

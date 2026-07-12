@@ -1,4 +1,4 @@
-"""Investimentos & Patrimônio Lutcho e Lidy — interface Streamlit (8 abas).
+"""Investimentos & Patrimônio Lutcho e Lidy — interface Streamlit (9 abas).
 
 Uso pessoal. Local-first: os dados ficam em `patrimonio.db` na sua máquina.
 Indicadores e cotas vêm apenas de fontes oficiais (BCB, CVM); estimativas são
@@ -278,10 +278,154 @@ def aba_painel(titular_id: int | None) -> None:
     st.caption("*IR estimado pela tabela regressiva (Lei 11.033/2004). O Informe de Rendimentos oficial prevalece.")
 
     if cons.alertas:
-        st.subheader("Alertas")
-        icones = {"revisao": "🔴", "atencao": "🟡", "info": "🔵"}
-        for nome, alerta in cons.alertas:
-            st.write(f"{icones.get(alerta.nivel, '•')} **{nome}** — {alerta.mensagem}")
+        n_rev = sum(1 for _, al in cons.alertas if al.nivel == "revisao")
+        n_at = sum(1 for _, al in cons.alertas if al.nivel == "atencao")
+        n_info = sum(1 for _, al in cons.alertas if al.nivel == "info")
+        partes = []
+        if n_rev:
+            partes.append(f"🔴 {n_rev} para revisar")
+        if n_at:
+            partes.append(f"🟡 {n_at} de atenção")
+        if n_info:
+            partes.append(f"🔵 {n_info} informativos")
+        st.info(
+            f"**{len(cons.alertas)} alertas** ({', '.join(partes)}). "
+            "Veja o detalhamento e a análise com IA na aba 🔔 Alertas."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Aba: Alertas
+# --------------------------------------------------------------------------- #
+_ICONES_ALERTA = {"revisao": "🔴", "atencao": "🟡", "info": "🔵"}
+_ORDEM_ALERTA = {"revisao": 0, "atencao": 1, "info": 2}
+
+
+def aba_alertas(titular_id: int | None) -> None:
+    st.header("🔔 Alertas")
+    st.caption(
+        "Cada alerta explica o porquê e sugere uma direção quanto ao montante "
+        "investido. Comparações são contra o CDI oficial; IR/come-cotas são "
+        "estimativas rotuladas. Não substitui assessoria certificada pela CVM."
+    )
+
+    with st.spinner("Analisando carteira..."):
+        cons = analise.consolidar(titular_id=titular_id)
+
+    if not cons.analises:
+        st.info("Nenhum ativo cadastrado ainda. Vá até a aba 📋 Ativos para começar.")
+        return
+
+    # Ativos com pelo menos um alerta, ordenados por severidade e montante.
+    com_alerta = [a for a in cons.analises if a.alertas]
+    if not com_alerta:
+        st.success("Nenhum alerta no momento. Sua carteira está dentro dos parâmetros. 🎉")
+        return
+
+    def _sev(a: "analise.AnaliseAtivo") -> int:
+        return min(_ORDEM_ALERTA.get(al.nivel, 9) for al in a.alertas)
+
+    com_alerta.sort(key=lambda a: (_sev(a), -a.valor_aplicado))
+
+    n_rev = sum(1 for _, al in cons.alertas if al.nivel == "revisao")
+    n_at = sum(1 for _, al in cons.alertas if al.nivel == "atencao")
+    n_info = sum(1 for _, al in cons.alertas if al.nivel == "info")
+    montante_critico = sum(
+        a.valor_aplicado
+        for a in com_alerta
+        if any(al.nivel in ("revisao", "atencao") for al in a.alertas)
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🔴 Revisar", str(n_rev))
+    c2.metric("🟡 Atenção", str(n_at))
+    c3.metric("🔵 Informativos", str(n_info))
+    c4.metric("Montante sob alerta", brl(montante_critico))
+
+    # ------------------------------------------------------------------ #
+    # Aprofundamento com IA (Consultor)
+    # ------------------------------------------------------------------ #
+    st.divider()
+    if consultor.disponivel():
+        st.subheader("🧠 Aprofundar com IA")
+        st.caption(
+            f"Modelo: {consultor.modelo_atual()}. A IA busca taxas atuais em fontes "
+            "oficiais e prioriza as ações pelo montante investido."
+        )
+        assinatura = "|".join(
+            f"{a.ativo_id}:{_sev(a)}:{round(a.valor_aplicado)}" for a in com_alerta
+        )
+        estado_ia = st.session_state.get("ia_alertas")
+        if st.button("Gerar análise aprofundada com IA", type="primary"):
+            itens = [
+                {
+                    "nome": a.nome,
+                    "categoria": a.categoria,
+                    "titular": a.titular,
+                    "valor_aplicado": a.valor_aplicado,
+                    "valor_atual": a.valor_atual,
+                    "pct_carteira": (a.valor_atual / cons.total_atual) if cons.total_atual else None,
+                    "rent_bruta": a.rent_bruta,
+                    "pct_cdi": a.pct_cdi,
+                    "rent_real": a.rent_real,
+                    "taxa_adm_aa": None,
+                    "alertas": [al.mensagem for al in a.alertas],
+                }
+                for a in com_alerta
+            ]
+            contexto = (
+                f"Patrimônio atual: {brl(cons.total_atual)}; total aplicado: "
+                f"{brl(cons.total_aplicado)}; ganho: {brl(cons.ganho)} "
+                f"({pct(cons.rent_media_ponderada)}). {len(com_alerta)} ativos em alerta."
+            )
+            try:
+                with st.spinner("Consultando a IA (pode buscar taxas atuais)..."):
+                    resp = consultor.analisar_alertas(itens, contexto_carteira=contexto)
+                st.session_state["ia_alertas"] = {"chave": assinatura, "resp": resp}
+                estado_ia = st.session_state["ia_alertas"]
+            except Exception as exc:  # rede/API: degrada com clareza
+                st.error(f"Não foi possível gerar a análise com IA: {exc}")
+
+        if estado_ia and estado_ia.get("resp") is not None:
+            if estado_ia.get("chave") != assinatura:
+                st.caption("⚠️ A carteira mudou desde esta análise — gere novamente para atualizar.")
+            resp = estado_ia["resp"]
+            st.markdown(resp.texto)
+            if resp.buscas_realizadas:
+                with st.expander("Buscas realizadas pela IA"):
+                    for q in resp.buscas_realizadas:
+                        st.write(f"- {q}")
+    else:
+        st.info(
+            "Configure a `ANTHROPIC_API_KEY` (arquivo `.env`) para habilitar o "
+            "aprofundamento dos alertas com IA. Os detalhes abaixo já ficam disponíveis."
+        )
+
+    # ------------------------------------------------------------------ #
+    # Detalhamento determinístico por ativo
+    # ------------------------------------------------------------------ #
+    st.divider()
+    st.subheader("Detalhamento por ativo")
+    for a in com_alerta:
+        sev = _sev(a)
+        icone = _ICONES_ALERTA.get(
+            next(al.nivel for al in sorted(a.alertas, key=lambda x: _ORDEM_ALERTA.get(x.nivel, 9))),
+            "•",
+        )
+        pct_cart = (a.valor_atual / cons.total_atual) if cons.total_atual else None
+        with st.container(border=True):
+            st.markdown(f"### {icone} {a.nome}")
+            st.caption(f"{a.titular} · {a.categoria}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Aplicado", brl(a.valor_aplicado))
+            m2.metric("Atual", brl(a.valor_atual))
+            m3.metric("% carteira", pct(pct_cart) if pct_cart is not None else "—")
+            m4.metric("% do CDI", pct(a.pct_cdi) if a.pct_cdi is not None else "—")
+            for al in sorted(a.alertas, key=lambda x: _ORDEM_ALERTA.get(x.nivel, 9)):
+                st.markdown(f"{_ICONES_ALERTA.get(al.nivel, '•')} **{al.mensagem}**")
+                if al.detalhe:
+                    st.markdown(al.detalhe)
+                if al.acao:
+                    st.markdown(f"➡️ **Direção sugerida:** {al.acao}")
 
 
 # --------------------------------------------------------------------------- #
@@ -992,6 +1136,7 @@ def main() -> None:
     abas = st.tabs(
         [
             "📊 Painel",
+            "🔔 Alertas",
             "📋 Ativos",
             "📥 Importar extrato",
             "📝 Atualizar valores",
@@ -1004,18 +1149,20 @@ def main() -> None:
     with abas[0]:
         aba_painel(titular_id)
     with abas[1]:
-        aba_ativos(titular_id)
+        aba_alertas(titular_id)
     with abas[2]:
-        aba_importar()
+        aba_ativos(titular_id)
     with abas[3]:
-        aba_atualizar(titular_id)
+        aba_importar()
     with abas[4]:
-        aba_metas(titular_id)
+        aba_atualizar(titular_id)
     with abas[5]:
-        aba_consultor(titular_id)
+        aba_metas(titular_id)
     with abas[6]:
-        aba_simulador()
+        aba_consultor(titular_id)
     with abas[7]:
+        aba_simulador()
+    with abas[8]:
         aba_proventos_ir(titular_id)
 
 

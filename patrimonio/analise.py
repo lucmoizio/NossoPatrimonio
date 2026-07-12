@@ -41,10 +41,22 @@ def aliquota_ir(dias: int) -> float:
 
 @dataclass
 class Alerta:
-    """Alerta gerado para um ativo (nível: 'revisao' | 'atencao' | 'info')."""
+    """Alerta gerado para um ativo (nível: 'revisao' | 'atencao' | 'info').
+
+    `mensagem` é o resumo curto; `detalhe` explica o porquê com números; `acao`
+    indica a direção sugerida considerando o montante investido.
+    """
 
     nivel: str
     mensagem: str
+    detalhe: str = ""
+    acao: str = ""
+
+
+def _brl(valor: float) -> str:
+    """Formata BRL para uso nas mensagens (evita depender da camada de UI)."""
+    s = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
 
 
 @dataclass
@@ -150,43 +162,120 @@ def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
 
 
 def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
-    """Aplica as regras de alerta descritas em §4.4."""
+    """Aplica as regras de alerta descritas em §4.4, com detalhe e ação."""
     alertas: list[Alerta] = []
+    montante = _brl(a.valor_aplicado)
 
     if a.pct_cdi is not None:
         if a.pct_cdi < LIMIAR_CDI_REVISAO:
             alertas.append(
-                Alerta("revisao", f"Rende {a.pct_cdi:.0%} do CDI (< 70%) — revisar aplicação.")
+                Alerta(
+                    "revisao",
+                    f"Rende {a.pct_cdi:.0%} do CDI (< 70%) — revisar aplicação.",
+                    detalhe=(
+                        f"Desde a aplicação o ativo rendeu {a.rent_bruta:.1%} (bruto), "
+                        f"enquanto o CDI do mesmo período acumulou {a.cdi_periodo:.1%}. "
+                        f"Isso equivale a apenas {a.pct_cdi:.0%} do CDI — bem abaixo do "
+                        "custo de oportunidade de um pós-fixado simples."
+                    ),
+                    acao=(
+                        f"Prioridade de revisão. Há {montante} aplicados aqui: avalie "
+                        "realocar para um pós-fixado que renda perto de 100% do CDI, "
+                        "considerando o IR pelo prazo e a liquidez antes de resgatar."
+                    ),
+                )
             )
         elif a.pct_cdi < LIMIAR_CDI_ATENCAO:
             alertas.append(
-                Alerta("atencao", f"Rende {a.pct_cdi:.0%} do CDI (< 90%) — atenção.")
+                Alerta(
+                    "atencao",
+                    f"Rende {a.pct_cdi:.0%} do CDI (< 90%) — atenção.",
+                    detalhe=(
+                        f"Rendimento bruto de {a.rent_bruta:.1%} contra {a.cdi_periodo:.1%} "
+                        f"de CDI no período ({a.pct_cdi:.0%} do CDI). Ainda aceitável, "
+                        "mas abaixo do ideal."
+                    ),
+                    acao=(
+                        f"Acompanhar. Sobre {montante}: se seguir abaixo de 90% do CDI "
+                        "nos próximos meses, considere realocação."
+                    ),
+                )
             )
 
     if a.rent_real is not None and a.rent_real < 0:
         alertas.append(
-            Alerta("atencao", "Rentabilidade real negativa (perde para a inflação).")
+            Alerta(
+                "atencao",
+                "Rentabilidade real negativa (perde para a inflação).",
+                detalhe=(
+                    f"Descontada a inflação do período ({a.ipca_periodo:.1%} de IPCA), a "
+                    f"rentabilidade real é {a.rent_real:.1%}. O poder de compra de "
+                    f"{montante} está sendo corroído."
+                ),
+                acao=(
+                    "Reavaliar: o ativo não está preservando valor real. Compare com "
+                    "alternativas indexadas à inflação (ex.: Tesouro IPCA+) ou ao CDI."
+                ),
+            )
         )
 
     if str(a.categoria).upper() == "COE":
         alertas.append(
-            Alerta("atencao", "COE: liquidez e cenários limitados — revisar condições.")
+            Alerta(
+                "atencao",
+                "COE: liquidez e cenários limitados — revisar condições.",
+                detalhe=(
+                    "COEs têm resgate apenas no vencimento, payoff condicional e custos "
+                    "embutidos pouco transparentes; costumam render menos que o CDI no "
+                    "cenário neutro."
+                ),
+                acao=(
+                    f"Revisar o vencimento e as condições dos {montante}. Evitar novos "
+                    "aportes; ao vencer, redirecionar para produtos mais líquidos e claros."
+                ),
+            )
         )
 
     taxa_adm = ativo["taxa_adm_aa"]
     if taxa_adm is not None and float(taxa_adm) >= LIMIAR_TAXA_ADM:
         alertas.append(
-            Alerta("atencao", f"Taxa de administração alta ({float(taxa_adm):.2f}% a.a.).")
+            Alerta(
+                "atencao",
+                f"Taxa de administração alta ({float(taxa_adm):.2f}% a.a.).",
+                detalhe=(
+                    f"A taxa de {float(taxa_adm):.2f}% a.a. incide sobre todo o montante "
+                    "todo ano e corrói o retorno líquido, sobretudo em renda fixa."
+                ),
+                acao=(
+                    f"Sobre {montante}: comparar com fundos equivalentes de taxa menor. "
+                    "A taxa só se justifica com desempenho consistente acima dos pares."
+                ),
+            )
         )
 
     if a.data_snapshot:
         dias = _dias_entre(a.data_snapshot, hoje)
         if dias > DIAS_SNAPSHOT_VELHO:
             alertas.append(
-                Alerta("info", f"Último valor tem {dias} dias — atualize o snapshot.")
+                Alerta(
+                    "info",
+                    f"Último valor tem {dias} dias — atualize o snapshot.",
+                    detalhe=(
+                        f"O último valor registrado é de {dias} dias atrás; a análise de "
+                        "rentabilidade pode estar defasada."
+                    ),
+                    acao="Atualize o valor na aba 📝 Atualizar valores (manual ou via CVM).",
+                )
             )
     else:
-        alertas.append(Alerta("info", "Sem snapshot de valor registrado."))
+        alertas.append(
+            Alerta(
+                "info",
+                "Sem snapshot de valor registrado.",
+                detalhe="Sem um valor atual, a rentabilidade é assumida como zero.",
+                acao="Registre um snapshot de valor na aba 📝 Atualizar valores.",
+            )
+        )
 
     return alertas
 
