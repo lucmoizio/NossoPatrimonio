@@ -32,6 +32,7 @@ from patrimonio import (
     consultor,
     cvm,
     database,
+    importador_movimentacoes_xp,
     importador_xp,
     importador_xp_planilha,
     mercado,
@@ -431,6 +432,208 @@ def aba_alertas(titular_id: int | None) -> None:
 # --------------------------------------------------------------------------- #
 # Aba: Ativos
 # --------------------------------------------------------------------------- #
+def _estimar_datas_cvm(ativos: list) -> None:
+    """Expander para estimar a data de aplicação dos fundos pela cota da CVM."""
+    fundos = [a for a in ativos if a["cnpj"]]
+    with st.expander("🔎 Estimar data de aplicação pela CVM (fundos com CNPJ)", expanded=False):
+        st.caption(
+            "Estimativa pela cota oficial: cota de compra ≈ cota atual ÷ "
+            "(1 + rentabilidade bruta). **Assume aplicação única** (sem múltiplos "
+            "aportes/resgates) e não cobre FIDC nem renda fixa bancária. É uma "
+            "estimativa — confira antes de aplicar."
+        )
+        if not fundos:
+            st.info("Nenhum fundo com CNPJ neste titular.")
+            return
+
+        if st.button("Estimar datas pela CVM"):
+            rent_por_cnpj: dict[str, float] = {}
+            ref_dates: list[str] = []
+            for a in fundos:
+                snap = database.ultimo_snapshot(int(a["id"]))
+                va = float(a["valor_aplicado"] or 0.0)
+                if snap and va > 0:
+                    rent = float(snap["valor"]) / va - 1.0
+                    if rent > 0:
+                        rent_por_cnpj[a["cnpj"]] = rent
+                        ref_dates.append(snap["data"])
+            if not rent_por_cnpj:
+                st.warning(
+                    "Nenhum fundo com rentabilidade positiva e snapshot para estimar."
+                )
+            else:
+                try:
+                    with st.spinner(
+                        "Baixando o Informe Diário da CVM e estimando (pode levar "
+                        "alguns minutos na primeira vez)..."
+                    ):
+                        est = cvm.estimar_datas_aplicacao(rent_por_cnpj, max(ref_dates))
+                    st.session_state["estimativa_datas"] = est
+                except Exception as exc:  # rede/CVM: degrada com clareza
+                    st.error(f"Falha ao estimar pela CVM: {exc}")
+
+        est = st.session_state.get("estimativa_datas")
+        if not est:
+            return
+
+        por_cnpj: dict[str, list] = {}
+        for a in fundos:
+            chave = "".join(ch for ch in (a["cnpj"] or "") if ch.isdigit())
+            por_cnpj.setdefault(chave, []).append(a)
+
+        linhas = []
+        for cnpj_norm, info in est.items():
+            for a in por_cnpj.get(cnpj_norm, []):
+                linhas.append(
+                    {
+                        "aplicar": True,
+                        "id": int(a["id"]),
+                        "ativo": a["nome"],
+                        "data_atual": a["data_aplicacao"] or "",
+                        "data_estimada": info["data"],
+                        "desvio_cota_pct": round((info.get("desvio") or 0.0) * 100, 3),
+                    }
+                )
+        if not linhas:
+            st.info("Nenhuma estimativa disponível (FIDC/renda fixa ficam de fora).")
+            return
+
+        dfe = pd.DataFrame(linhas)
+        dfe["data_atual"] = pd.to_datetime(dfe["data_atual"], errors="coerce")
+        dfe["data_estimada"] = pd.to_datetime(dfe["data_estimada"], errors="coerce")
+        editado = st.data_editor(
+            dfe,
+            key="editor_estimativa",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "aplicar": st.column_config.CheckboxColumn("Aplicar"),
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ativo": st.column_config.TextColumn("Ativo", disabled=True, width="large"),
+                "data_atual": st.column_config.DateColumn("Data atual", format="DD/MM/YYYY", disabled=True),
+                "data_estimada": st.column_config.DateColumn("Data estimada", format="DD/MM/YYYY"),
+                "desvio_cota_pct": st.column_config.NumberColumn(
+                    "Desvio cota (%)", format="%.3f", disabled=True,
+                    help="Quão perto a cota encontrada ficou do alvo (menor = melhor)."
+                ),
+            },
+        )
+        st.caption(
+            "Data estimada é aproximada. Ajuste se souber a data real; desmarque "
+            "as que não quiser gravar."
+        )
+        if st.button("💾 Aplicar datas estimadas selecionadas", type="primary"):
+            n = 0
+            for _, l in editado.iterrows():
+                if not bool(l["aplicar"]):
+                    continue
+                iso = _iso_de_celula(l["data_estimada"])
+                if iso:
+                    database.atualizar_ativo(int(l["id"]), {"data_aplicacao": iso})
+                    n += 1
+            st.session_state.pop("estimativa_datas", None)
+            st.cache_data.clear()
+            st.success(f"{n} data(s) de aplicação gravada(s).")
+            st.rerun()
+
+
+def _datas_por_movimentacoes(ativos: list) -> None:
+    """Expander para preencher datas de aplicação a partir do extrato XP (dado real)."""
+    with st.expander(
+        "📄 Buscar datas reais pelo extrato de movimentações da XP", expanded=False
+    ):
+        st.caption(
+            "Envie o **Extrato de Movimentações** da XP (Excel de preferência; "
+            "PDF/CSV também). Extraio a **primeira aplicação** de cada ativo e caso "
+            "com a sua carteira por semelhança de nome. Leitura best-effort — "
+            "confira antes de gravar."
+        )
+        arq = st.file_uploader(
+            "Extrato de movimentações (.xlsx/.csv/.pdf)",
+            type=["xlsx", "xls", "csv", "pdf"],
+            key="upload_movimentacoes",
+        )
+        if arq is None:
+            return
+
+        chave = f"{arq.name}:{arq.size}"
+        estado = st.session_state.get("mov_estado")
+        if estado is None or estado.get("chave") != chave:
+            try:
+                with st.spinner("Lendo o extrato de movimentações..."):
+                    aplicacoes = importador_movimentacoes_xp.extrair_aplicacoes(
+                        arq.getvalue(), nome_arquivo=arq.name
+                    )
+            except importador_xp.ErroImportacaoXP as exc:
+                st.error(f"Não foi possível ler o extrato: {exc}")
+                return
+            propostas = importador_movimentacoes_xp.casar_com_ativos(aplicacoes, ativos)
+            st.session_state["mov_estado"] = {
+                "chave": chave,
+                "aplicacoes": aplicacoes,
+                "propostas": propostas,
+            }
+            estado = st.session_state["mov_estado"]
+
+        aplicacoes = estado["aplicacoes"]
+        propostas = estado["propostas"]
+        st.caption(f"{len(aplicacoes)} aplicação(ões) lida(s); {len(propostas)} casada(s) com a carteira.")
+        if not propostas:
+            st.warning(
+                "Nenhum ativo da carteira casou com o extrato. Verifique se é o "
+                "arquivo certo ou ajuste os nomes na tabela abaixo."
+            )
+            return
+
+        linhas = []
+        for p in propostas:
+            linhas.append(
+                {
+                    "aplicar": True,
+                    "id": p["id"],
+                    "ativo": p["ativo"],
+                    "data_atual": p["data_atual"],
+                    "data_detectada": p["data_detectada"],
+                    "casou_com": p["origem"],
+                    "score": p["score"],
+                }
+            )
+        dfm = pd.DataFrame(linhas)
+        dfm["data_atual"] = pd.to_datetime(dfm["data_atual"], errors="coerce")
+        dfm["data_detectada"] = pd.to_datetime(dfm["data_detectada"], errors="coerce")
+        editado = st.data_editor(
+            dfm,
+            key="editor_movimentacoes",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "aplicar": st.column_config.CheckboxColumn("Aplicar"),
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ativo": st.column_config.TextColumn("Ativo", disabled=True, width="large"),
+                "data_atual": st.column_config.DateColumn("Data atual", format="DD/MM/YYYY", disabled=True),
+                "data_detectada": st.column_config.DateColumn("Data detectada", format="DD/MM/YYYY"),
+                "casou_com": st.column_config.TextColumn("Casou com (extrato)", disabled=True),
+                "score": st.column_config.NumberColumn(
+                    "Similaridade", format="%.2f", disabled=True,
+                    help="Confiança do casamento de nomes (1,00 = idêntico)."
+                ),
+            },
+        )
+        if st.button("💾 Aplicar datas do extrato selecionadas", type="primary"):
+            n = 0
+            for _, l in editado.iterrows():
+                if not bool(l["aplicar"]):
+                    continue
+                iso = _iso_de_celula(l["data_detectada"])
+                if iso:
+                    database.atualizar_ativo(int(l["id"]), {"data_aplicacao": iso})
+                    n += 1
+            st.session_state.pop("mov_estado", None)
+            st.cache_data.clear()
+            st.success(f"{n} data(s) de aplicação gravada(s) a partir do extrato.")
+            st.rerun()
+
+
 def aba_ativos(titular_id: int | None) -> None:
     st.header("📋 Ativos")
     mapa = _mapa_titulares()
@@ -478,6 +681,9 @@ def aba_ativos(titular_id: int | None) -> None:
     if not ativos:
         st.info("Nenhum ativo cadastrado.")
         return
+
+    _estimar_datas_cvm(ativos)
+    _datas_por_movimentacoes(ativos)
 
     st.subheader("Carteira cadastrada")
     st.caption(

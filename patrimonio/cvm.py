@@ -283,6 +283,125 @@ def novo_valor_estimado(
     }
 
 
+def _cotas_mes_multi(aaaamm: str, alvos: set[str]) -> dict[str, dict[str, float]]:
+    """{cnpj: {data_iso: cota}} para vários CNPJs num mês, em uma única leitura."""
+    conteudo = _baixar_informe(aaaamm)
+    saida: dict[str, dict[str, float]] = {c: {} for c in alvos}
+    with zipfile.ZipFile(io.BytesIO(conteudo)) as zf:
+        for nome in (n for n in zf.namelist() if n.lower().endswith(".csv")):
+            with zf.open(nome) as bruto:
+                texto = io.TextIOWrapper(bruto, encoding="latin-1", newline="")
+                leitor = csv.DictReader(texto, delimiter=";")
+                col_cnpj = next(
+                    (c for c in _COLS_CNPJ if c in (leitor.fieldnames or [])), None
+                )
+                if col_cnpj is None:
+                    continue
+                for linha in leitor:
+                    cnpj = _so_digitos(linha.get(col_cnpj, ""))
+                    if cnpj not in alvos:
+                        continue
+                    data_str = (linha.get(_COL_DATA) or "").strip()
+                    cota_str = (linha.get(_COL_COTA) or "").strip()
+                    if not data_str or not cota_str:
+                        continue
+                    try:
+                        saida[cnpj][data_str] = float(cota_str.replace(",", "."))
+                    except ValueError:
+                        continue
+    return saida
+
+
+def estimar_datas_aplicacao(
+    rent_por_cnpj: dict[str, float],
+    data_ref: Optional[str] = None,
+    max_meses: int = 120,
+) -> dict[str, dict]:
+    """Estima a data de aplicação de cada fundo pela cota oficial da CVM.
+
+    Premissa (aplicação única): a cota na compra ≈ cota_atual / (1 + rent_bruta).
+    Busca no histórico do Informe Diário a data cuja cota mais se aproxima desse
+    alvo, retrocedendo mês a mês (uma leitura por mês para todos os CNPJs) e
+    parando cada fundo quando a série cruza o alvo.
+
+    `rent_por_cnpj` mapeia CNPJ → rentabilidade bruta acumulada (fração). Retorna
+    {cnpj: {data, cota, cota_alvo, cota_atual, data_cota_atual, desvio}} apenas
+    para os fundos com estimativa possível (rent_bruta > 0 e cotas disponíveis).
+    É uma ESTIMATIVA — a UI a rotula como tal e pede confirmação.
+    """
+    alvos = {_so_digitos(c): c for c in rent_por_cnpj if c}
+    if not alvos:
+        return {}
+    limite = datetime.fromisoformat(data_ref).date() if data_ref else date.today()
+
+    atuais = cotas_para_cnpjs(set(alvos), limite.isoformat())
+    metas: dict[str, dict] = {}
+    for cnpj_norm in list(alvos):
+        rent = rent_por_cnpj[alvos[cnpj_norm]]
+        info = atuais.get(cnpj_norm)
+        if info is None or rent is None or rent <= 0:
+            continue
+        data_cota_atual, cota_atual = info
+        if cota_atual <= 0:
+            continue
+        metas[cnpj_norm] = {
+            "cota_alvo": cota_atual / (1.0 + rent),
+            "cota_atual": cota_atual,
+            "data_cota_atual": data_cota_atual,
+            "melhor_data": None,
+            "melhor_cota": None,
+            "melhor_desvio": None,
+            "done": False,
+        }
+
+    pendentes = set(metas)
+    base = limite
+    for recuo in range(0, max_meses + 1):
+        if not pendentes:
+            break
+        ano = base.year
+        mes = base.month - recuo
+        while mes <= 0:
+            mes += 12
+            ano -= 1
+        aaaamm = f"{ano:04d}{mes:02d}"
+        try:
+            series = _cotas_mes_multi(aaaamm, set(pendentes))
+        except (ErroDadosCVM, zipfile.BadZipFile):
+            continue
+        for cnpj_norm in list(pendentes):
+            meta = metas[cnpj_norm]
+            alvo = meta["cota_alvo"]
+            cruzou = False
+            for data_str, cota in series.get(cnpj_norm, {}).items():
+                if datetime.fromisoformat(data_str).date() > limite:
+                    continue
+                desvio = abs(cota - alvo)
+                if meta["melhor_desvio"] is None or desvio < meta["melhor_desvio"]:
+                    meta["melhor_desvio"] = desvio
+                    meta["melhor_data"] = data_str
+                    meta["melhor_cota"] = cota
+                if cota <= alvo:
+                    cruzou = True
+            if cruzou:
+                pendentes.discard(cnpj_norm)
+
+    resultado: dict[str, dict] = {}
+    for cnpj_norm, meta in metas.items():
+        if meta["melhor_data"] is None:
+            continue
+        cota_alvo = meta["cota_alvo"]
+        resultado[cnpj_norm] = {
+            "data": meta["melhor_data"],
+            "cota": meta["melhor_cota"],
+            "cota_alvo": round(cota_alvo, 6),
+            "cota_atual": meta["cota_atual"],
+            "data_cota_atual": meta["data_cota_atual"],
+            "desvio": (meta["melhor_cota"] / cota_alvo - 1.0) if cota_alvo else None,
+        }
+    return resultado
+
+
 if __name__ == "__main__":  # smoke manual (requer rede)
     # CNPJ de exemplo; substitua por um fundo real para testar.
     print(cota_mais_recente("00.000.000/0001-00"))
