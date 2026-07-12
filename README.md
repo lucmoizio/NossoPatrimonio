@@ -38,8 +38,17 @@ O banco `patrimonio.db` é criado automaticamente no primeiro uso.
 
 ### (Opcional) Consultor IA
 
-O Consultor IA usa a API da Anthropic. Defina a variável de ambiente antes de
-rodar (sem ela, as demais abas funcionam normalmente):
+O Consultor IA usa a API da Anthropic (sem chave, as demais abas funcionam
+normalmente). A forma recomendada é um arquivo `.env` na raiz do projeto, que é
+carregado automaticamente e **não** é versionado (está no `.gitignore`):
+
+```bash
+cp .env.example .env
+# edite o .env e preencha ANTHROPIC_API_KEY com sua chave
+```
+
+Gere a chave em https://console.anthropic.com/ → **API Keys**. Como alternativa,
+você pode exportar a variável no shell antes de rodar:
 
 ```bash
 export ANTHROPIC_API_KEY="sua-chave"

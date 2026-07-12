@@ -11,6 +11,16 @@ from __future__ import annotations
 
 from datetime import date
 
+# Carrega variáveis de um arquivo .env na raiz (ex.: ANTHROPIC_API_KEY), se
+# existir. Opcional: se o python-dotenv não estiver instalado, seguimos apenas
+# com as variáveis de ambiente já definidas no shell.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
