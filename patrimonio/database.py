@@ -205,6 +205,8 @@ def inicializar(caminho: Optional[Path] = None) -> None:
         _garantir_coluna(con, "ativos", "come_cotas", "INTEGER NOT NULL DEFAULT 0")
         _garantir_coluna(con, "ativos", "observacoes", "TEXT")
         _garantir_coluna(con, "ativos", "ativo", "INTEGER NOT NULL DEFAULT 1")
+        # Rentabilidade total do extrato XP (inclui cupons pagos fora da posição).
+        _garantir_coluna(con, "ativos", "rent_bruta_extrato", "REAL")
 
         # Seed dos titulares fixos.
         for nome in TITULARES_PADRAO:
@@ -291,6 +293,7 @@ def inserir_ativo(
     valor_aplicado: float = 0.0,
     observacoes: Optional[str] = None,
     cnpj: Optional[str] = None,
+    rent_bruta_extrato: Optional[float] = None,
     caminho: Optional[Path] = None,
 ) -> int:
     """Cadastra um ativo e retorna seu id."""
@@ -300,8 +303,8 @@ def inserir_ativo(
             INSERT INTO ativos (
                 titular_id, nome, categoria, liquidez, taxa_adm_aa,
                 isento_ir, come_cotas, data_aplicacao, valor_aplicado,
-                observacoes, ativo, cnpj
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                observacoes, ativo, cnpj, rent_bruta_extrato
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 titular_id,
@@ -315,6 +318,7 @@ def inserir_ativo(
                 valor_aplicado,
                 observacoes,
                 cnpj,
+                rent_bruta_extrato,
             ),
         )
         return int(cur.lastrowid)
@@ -365,7 +369,7 @@ def atualizar_ativo(ativo_id: int, campos: dict[str, Any], caminho: Optional[Pat
     permitidos = {
         "nome", "categoria", "liquidez", "taxa_adm_aa", "isento_ir",
         "come_cotas", "data_aplicacao", "valor_aplicado", "observacoes",
-        "ativo", "cnpj", "titular_id",
+        "ativo", "cnpj", "titular_id", "rent_bruta_extrato",
     }
     atualizacoes = {k: v for k, v in campos.items() if k in permitidos}
     if not atualizacoes:

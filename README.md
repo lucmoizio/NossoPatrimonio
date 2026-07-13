@@ -178,6 +178,11 @@ motor de fundos, inclua a tabela em `_TABELAS_ZERAR_*` em `database.py` e, se
 houver cache em arquivo, limpe-o em `app.py` (`_sidebar_zerar_dados`). O
 cadastro oficial `fundos_cadastro` (referência CVM) é preservado de propósito.
 
+**Rentabilidade do extrato XP:** a coluna *Rentabilidade* da Posição Detalhada
+é gravada em `rent_bruta_extrato` e usada na análise quando presente (retorno
+total, incluindo cupons fora da posição — essencial para COE/RF com cupom).
+Reimporte o extrato para atualizar ativos já cadastrados.
+
 ## Princípios inegociáveis
 
 1. Nenhum dado inventado — só fontes oficiais (BCB, CVM).

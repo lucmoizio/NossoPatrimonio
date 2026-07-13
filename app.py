@@ -281,19 +281,22 @@ def aba_painel(titular_id: int | None) -> None:
     st.subheader("Tabela analítica por ativo")
     linhas = []
     for a in cons.analises:
-        linhas.append(
-            {
-                "Ativo": a.nome,
-                "Titular": a.titular,
-                "Categoria": a.categoria,
-                "Aplicado": brl(a.valor_aplicado),
-                "Atual": brl(a.valor_atual),
-                "Rent. bruta": pct(a.rent_bruta),
-                "% do CDI": pct(a.pct_cdi) if a.pct_cdi is not None else "—",
-                "Rent. real": pct(a.rent_real) if a.rent_real is not None else "—",
-                "IR estimado*": brl(a.ir_estimado),
-            }
-        )
+        linha = {
+            "Ativo": a.nome,
+            "Titular": a.titular,
+            "Categoria": a.categoria,
+            "Aplicado": brl(a.valor_aplicado),
+            "Posição": brl(a.valor_atual),
+            "Rent. bruta": pct(a.rent_bruta),
+            "% do CDI": pct(a.pct_cdi) if a.pct_cdi is not None else "—",
+            "Rent. real": pct(a.rent_real) if a.rent_real is not None else "—",
+            "IR estimado*": brl(a.ir_estimado),
+        }
+        if a.rent_fonte == "extrato":
+            linha["Rent. bruta"] = f"{pct(a.rent_bruta)} (extrato)"
+            if a.valor_economico is not None:
+                linha["Retorno total"] = brl(a.valor_economico)
+        linhas.append(linha)
     st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
     st.caption("*IR estimado pela tabela regressiva (Lei 11.033/2004). O Informe de Rendimentos oficial prevalece.")
 
@@ -1261,6 +1264,7 @@ def aba_importar() -> None:
                 "quantidade": p.quantidade,
                 "valor_aplicado": valor_aplicado,
                 "data_aplicacao": data_aplic,
+                "rent_bruta_pct": (p.rent_bruta * 100) if p.rent_bruta is not None else None,
                 "taxa_adm_aa": 0.0,
                 "isento_ir": False,
                 "come_cotas": p.categoria in ("Renda Fixa - Pós-fixado", "Crédito Privado", "Fundo Multimercado"),
@@ -1270,12 +1274,20 @@ def aba_importar() -> None:
     df["data_aplicacao"] = pd.to_datetime(df["data_aplicacao"], errors="coerce")
 
     tem_valor_aplicado = any(p.valor_aplicado is not None for p in resultado.posicoes)
-    st.caption(
-        "Confira e ajuste. O valor aplicado veio do arquivo."
-        if tem_valor_aplicado
-        else "Confira e ajuste. `valor_aplicado` assume o saldo atual por padrão "
-        "(rentabilidade inicia em 0 até você informar o custo real de aquisição)."
-    )
+    tem_rent_extrato = any(p.rent_bruta is not None for p in resultado.posicoes)
+    if tem_valor_aplicado:
+        msg = "Confira e ajuste. O valor aplicado veio do arquivo."
+        if tem_rent_extrato:
+            msg += (
+                " A coluna Rentabilidade (%) veio do extrato XP e será usada na análise "
+                "(inclui cupons fora da posição, ex.: COE com cupom semestral)."
+            )
+    else:
+        msg = (
+            "Confira e ajuste. `valor_aplicado` assume o saldo atual por padrão "
+            "(rentabilidade inicia em 0 até você informar o custo real de aquisição)."
+        )
+    st.caption(msg)
     editado = st.data_editor(
         df,
         key="editor_import",
@@ -1291,6 +1303,11 @@ def aba_importar() -> None:
             "quantidade": st.column_config.NumberColumn("Qtd. cotas", format="%.6f"),
             "valor_aplicado": st.column_config.NumberColumn("Valor aplicado", format="%.2f"),
             "data_aplicacao": st.column_config.DateColumn("Data aplicação", format="DD/MM/YYYY"),
+            "rent_bruta_pct": st.column_config.NumberColumn(
+                "Rentabilidade (%)",
+                format="%.2f",
+                help="Do extrato XP. Inclui cupons pagos fora da posição.",
+            ),
             "taxa_adm_aa": st.column_config.NumberColumn("Taxa adm (% a.a.)", format="%.2f"),
             "isento_ir": st.column_config.CheckboxColumn("Isento IR"),
             "come_cotas": st.column_config.CheckboxColumn("Come-cotas"),
@@ -1319,15 +1336,26 @@ def aba_importar() -> None:
             cnpj_digitos = "".join(ch for ch in str(linha["cnpj"] or "") if ch.isdigit()) or None
             saldo = float(linha["saldo_bruto"])
             data_snap = _iso_de_celula(linha["data_aplicacao"]) or data_ref
+            rent_pct = linha.get("rent_bruta_pct")
+            rent_extrato = None
+            if rent_pct is not None and not pd.isna(rent_pct):
+                rent_extrato = float(rent_pct) / 100.0
 
             existente_id = existentes.get(nome.lower())
             if existente_id is not None:
                 if not atualizar_existentes:
                     ignorados += 1
                     continue
-                campos = {"cnpj": cnpj_digitos, "categoria": str(linha["categoria"])}
+                campos = {
+                    "cnpj": cnpj_digitos,
+                    "categoria": str(linha["categoria"]),
+                    "valor_aplicado": float(linha["valor_aplicado"]),
+                    "data_aplicacao": data_snap,
+                }
+                if rent_extrato is not None:
+                    campos["rent_bruta_extrato"] = rent_extrato
                 database.atualizar_ativo(existente_id, campos)
-                database.registrar_snapshot(existente_id, data_snap, saldo)
+                database.registrar_snapshot(existente_id, data_ref, saldo)
                 atualizados += 1
             else:
                 novo_id = database.inserir_ativo(
@@ -1340,9 +1368,10 @@ def aba_importar() -> None:
                     data_aplicacao=data_snap,
                     valor_aplicado=float(linha["valor_aplicado"]),
                     cnpj=cnpj_digitos,
+                    rent_bruta_extrato=rent_extrato,
                     observacoes=f"Importado do extrato XP (conta {meta.conta or '?'}, ref. {meta.data_referencia or '?'})",
                 )
-                database.registrar_snapshot(novo_id, data_snap, saldo)
+                database.registrar_snapshot(novo_id, data_ref, saldo)
                 criados += 1
             total_gravado += saldo
 

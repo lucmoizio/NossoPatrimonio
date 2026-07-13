@@ -68,17 +68,33 @@ class AnaliseAtivo:
     titular: str
     categoria: str
     valor_aplicado: float
-    valor_atual: float
+    valor_atual: float                       # saldo da posição (snapshot)
     data_snapshot: Optional[str]
-    rent_bruta: float                       # atual/aplicado - 1
-    cdi_periodo: Optional[float]            # CDI acumulado no período do ativo
+    rent_bruta: float                        # retorno total do período
+    cdi_periodo: Optional[float]
     ipca_periodo: Optional[float]
-    pct_cdi: Optional[float]                # rent_bruta / cdi_periodo
-    rent_real: Optional[float]              # deflacionada pelo IPCA
-    ir_estimado: float                      # em BRL (0 se isento)
+    pct_cdi: Optional[float]
+    rent_real: Optional[float]
+    ir_estimado: float
     aliquota_ir_pct: float
     ganho_bruto: float
+    rent_fonte: str = "posicao"              # 'posicao' | 'extrato'
+    valor_economico: Optional[float] = None  # aplicado × (1+rent) quando extrato
     alertas: list[Alerta] = field(default_factory=list)
+
+
+def _rent_bruta_extrato(ativo: Any) -> Optional[float]:
+    """Rentabilidade total gravada do extrato XP (fração), ou None."""
+    if "rent_bruta_extrato" not in ativo.keys():
+        return None
+    v = ativo["rent_bruta_extrato"]
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return f if f > -1.0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _dias_entre(inicio: str, fim: str) -> int:
@@ -90,9 +106,9 @@ def _dias_entre(inicio: str, fim: str) -> int:
 def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
     """Analisa um ativo (Row de `ativos` + join titular) contra CDI/IPCA.
 
-    Usa o último snapshot como valor atual; se não houver, usa o valor
-    aplicado (rentabilidade zero). Indicadores de mercado que não puderem ser
-    obtidos vêm como None (nunca estimados silenciosamente).
+    Usa o último snapshot como valor da posição. Quando `rent_bruta_extrato`
+    estiver gravado (campo Rentabilidade do extrato XP), usa esse retorno total
+    — que inclui cupons pagos fora da posição — para rent_bruta, %CDI e ganho.
     """
     hoje = hoje or date.today().isoformat()
     ativo_id = int(ativo["id"])
@@ -100,14 +116,25 @@ def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
 
     snap = database.ultimo_snapshot(ativo_id)
     if snap is not None:
-        valor_atual = float(snap["valor"])
+        valor_posicao = float(snap["valor"])
         data_snapshot = snap["data"]
     else:
-        valor_atual = valor_aplicado
+        valor_posicao = valor_aplicado
         data_snapshot = None
 
-    rent_bruta = (valor_atual / valor_aplicado - 1.0) if valor_aplicado > 0 else 0.0
-    ganho_bruto = valor_atual - valor_aplicado
+    rent_extrato = _rent_bruta_extrato(ativo)
+    if rent_extrato is not None and valor_aplicado > 0:
+        rent_bruta = rent_extrato
+        valor_economico = round(valor_aplicado * (1.0 + rent_bruta), 2)
+        ganho_bruto = round(valor_economico - valor_aplicado, 2)
+        rent_fonte = "extrato"
+    else:
+        rent_bruta = (valor_posicao / valor_aplicado - 1.0) if valor_aplicado > 0 else 0.0
+        ganho_bruto = valor_posicao - valor_aplicado
+        valor_economico = None
+        rent_fonte = "posicao"
+
+    valor_atual = valor_posicao
 
     # Período do ativo (da 1ª aplicação até hoje) para benchmarks.
     data_aplic = ativo["data_aplicacao"]
@@ -156,6 +183,8 @@ def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
         ir_estimado=ir_estimado,
         aliquota_ir_pct=round(aliq * 100, 1),
         ganho_bruto=ganho_bruto,
+        rent_fonte=rent_fonte,
+        valor_economico=valor_economico,
     )
     analise.alertas = _gerar_alertas(ativo, analise, hoje)
     return analise
@@ -167,13 +196,18 @@ def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
     montante = _brl(a.valor_aplicado)
 
     if a.pct_cdi is not None:
+        fonte_rent = (
+            " (rentabilidade total do extrato XP, inclui cupons fora da posição)"
+            if a.rent_fonte == "extrato"
+            else ""
+        )
         if a.pct_cdi < LIMIAR_CDI_REVISAO:
             alertas.append(
                 Alerta(
                     "revisao",
                     f"Rende {a.pct_cdi:.0%} do CDI (< 70%) — revisar aplicação.",
                     detalhe=(
-                        f"Desde a aplicação o ativo rendeu {a.rent_bruta:.1%} (bruto), "
+                        f"Desde a aplicação o ativo rendeu {a.rent_bruta:.1%} (bruto{fonte_rent}), "
                         f"enquanto o CDI do mesmo período acumulou {a.cdi_periodo:.1%}. "
                         f"Isso equivale a apenas {a.pct_cdi:.0%} do CDI — bem abaixo do "
                         "custo de oportunidade de um pós-fixado simples."
@@ -220,15 +254,26 @@ def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
         )
 
     if str(a.categoria).upper() == "COE":
+        det_coe = (
+            "COEs têm resgate apenas no vencimento, payoff condicional e custos "
+            "embutidos pouco transparentes."
+        )
+        if a.rent_fonte == "extrato":
+            det_coe += (
+                f" A rentabilidade usada ({a.rent_bruta:.1%}) veio do extrato XP e "
+                "inclui cupons — compare também com a taxa prefixada contratada, "
+                "não só com o CDI."
+            )
+        else:
+            det_coe += (
+                " A rentabilidade atual usa só o saldo da posição; se o COE paga "
+                "cupons na conta, reimporte o extrato XP para incluir a rentabilidade total."
+            )
         alertas.append(
             Alerta(
                 "atencao",
                 "COE: liquidez e cenários limitados — revisar condições.",
-                detalhe=(
-                    "COEs têm resgate apenas no vencimento, payoff condicional e custos "
-                    "embutidos pouco transparentes; costumam render menos que o CDI no "
-                    "cenário neutro."
-                ),
+                detalhe=det_coe,
                 acao=(
                     f"Revisar o vencimento e as condições dos {montante}. Evitar novos "
                     "aportes; ao vencer, redirecionar para produtos mais líquidos e claros."
