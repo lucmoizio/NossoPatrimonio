@@ -34,6 +34,7 @@ from patrimonio import (
     database,
     fundos,
     importador_movimentacoes_xp,
+    importador_extrato_conta_xp,
     importador_xp,
     importador_xp_planilha,
     mercado,
@@ -159,6 +160,7 @@ def render_sidebar() -> int | None:
 # Chaves de session_state ligadas à carteira — limpar no reset da plataforma.
 _ESTADOS_ZERAR = (
     "import_estado",
+    "extrato_conta_estado",
     "aval_carteira",
     "aval_titular",
     "estimativa_datas",
@@ -166,16 +168,24 @@ _ESTADOS_ZERAR = (
     "ia_alertas",
 )
 
+# Prefixos de widgets Streamlit do extrato da conta (evita estado stale após zerar).
+_PREFIXOS_WIDGETS_ZERAR = (
+    "upload_extrato_conta",
+    "editor_extrato_datas",
+    "editor_extrato_prov",
+    "btn_extrato_",
+)
+
 
 def _sidebar_zerar_dados() -> None:
     """Seção de reset: apaga os dados da plataforma após dupla confirmação."""
     with st.sidebar.expander("⚠️ Zerar dados", expanded=False):
         st.caption(
-            "Apaga toda a carteira (ativos, snapshots, aportes/resgates e "
-            "proventos), o cache de cotas/universo de fundos e os CNPJs "
-            "validados em importações anteriores — para recomeçar do zero. "
-            "Os titulares e o cadastro oficial de classes da CVM são mantidos. "
-            "Ação irreversível."
+            "Apaga toda a carteira (ativos, snapshots, aportes/resgates, proventos, "
+            "datas de entrada, rent_bruta_extrato e o ledger **extrato_conta**), o cache "
+            "de cotas/universo de fundos e os CNPJs validados em importações anteriores — "
+            "para recomeçar do zero. Os titulares e o cadastro oficial de classes da CVM "
+            "são mantidos. Ação irreversível."
         )
         incluir_metas = st.checkbox("Apagar também metas", value=True, key="zerar_metas")
         incluir_sim = st.checkbox("Apagar também simulador", value=True, key="zerar_sim")
@@ -195,6 +205,9 @@ def _sidebar_zerar_dados() -> None:
             # Limpa estados de importação, recomendação e caches em memória.
             for chave in _ESTADOS_ZERAR:
                 st.session_state.pop(chave, None)
+            for chave in list(st.session_state.keys()):
+                if any(chave.startswith(p) for p in _PREFIXOS_WIDGETS_ZERAR):
+                    st.session_state.pop(chave, None)
             st.cache_data.clear()
             st.success(
                 f"Dados zerados: {total} registros removidos "
@@ -217,11 +230,18 @@ def aba_painel(titular_id: int | None) -> None:
         st.info("Nenhum ativo cadastrado ainda. Vá até a aba 📋 Ativos para começar.")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Patrimônio atual", brl(cons.total_atual))
     c2.metric("Total aplicado", brl(cons.total_aplicado))
     c3.metric("Ganho bruto", brl(cons.ganho), delta=pct(cons.rent_media_ponderada))
     c4.metric("Alertas", str(len(cons.alertas)))
+    com_data = sum(1 for a in cons.analises if a.cdi_periodo is not None)
+    c5.metric("Com data de entrada", f"{com_data}/{len(cons.analises)}")
+    if com_data < len(cons.analises):
+        st.caption(
+            f"{len(cons.analises) - com_data} ativo(s) sem data de entrada — não entram no "
+            "gráfico Rentabilidade × CDI. Use **Importar extrato → Datas de início**."
+        )
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -236,21 +256,57 @@ def aba_painel(titular_id: int | None) -> None:
             st.plotly_chart(fig, use_container_width=True)
 
     with col_b:
-        st.subheader("Rentabilidade do ativo × CDI do período")
-        dados_barras = [
-            {
-                "Ativo": a.nome,
-                "Rent. bruta": a.rent_bruta * 100,
-                "CDI do período": (a.cdi_periodo or 0) * 100,
-            }
-            for a in cons.analises
-            if a.cdi_periodo is not None
-        ]
-        if dados_barras:
-            dfb = pd.DataFrame(dados_barras).melt(
-                id_vars="Ativo", var_name="Série", value_name="%"
+        st.subheader("Rentabilidade do ativo × CDI acumulado")
+        st.caption(
+            "Período **individual por ativo**: da data de 1ª aplicação até hoje "
+            "(CDI acumulado — fonte BCB). Passe o mouse nas barras para ver as datas."
+        )
+        datas_aplic = [a.data_aplicacao for a in cons.analises if a.data_aplicacao]
+        if datas_aplic:
+            fim_cdi = next(
+                (a.data_fim_cdi for a in cons.analises if a.data_fim_cdi), None
             )
-            fig = px.bar(dfb, x="Ativo", y="%", color="Série", barmode="group")
+            st.caption(
+                f"Entradas na carteira entre **{data_br(min(datas_aplic))}** e "
+                f"**{data_br(max(datas_aplic))}**; CDI calculado até "
+                f"**{data_br(fim_cdi)}** (cada ativo usa seu próprio intervalo)."
+            )
+        dados_barras = []
+        for a in cons.analises:
+            if a.cdi_periodo is None:
+                continue
+            dados_barras.append(
+                {
+                    "Ativo": a.nome,
+                    "Rent. bruta": a.rent_bruta * 100,
+                    "CDI acum.": a.cdi_periodo * 100,
+                    "Período CDI": analise.rotulo_periodo_cdi(a),
+                    "Fonte rent.": "Extrato XP" if a.rent_fonte == "extrato" else "Posição",
+                }
+            )
+        if dados_barras:
+            dfb = pd.DataFrame(dados_barras)
+            df_long = dfb.melt(
+                id_vars=["Ativo", "Período CDI", "Fonte rent."],
+                value_vars=["Rent. bruta", "CDI acum."],
+                var_name="Série",
+                value_name="%",
+            )
+            fig = px.bar(
+                df_long,
+                x="Ativo",
+                y="%",
+                color="Série",
+                barmode="group",
+                custom_data=["Período CDI", "Fonte rent."],
+            )
+            fig.update_traces(
+                hovertemplate=(
+                    "<b>%{x}</b><br>%{fullData.name}: %{y:.2f}%<br>"
+                    "Período CDI: %{customdata[0]}<br>"
+                    "Fonte rent.: %{customdata[1]}<extra></extra>"
+                )
+            )
             fig.update_layout(margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
             total = len(cons.analises)
@@ -278,6 +334,49 @@ def aba_painel(titular_id: int | None) -> None:
     else:
         st.caption("Registre snapshots em datas diferentes para ver a evolução histórica.")
 
+    n_extrato = database.contar_extrato_conta(titular_id=titular_id)
+    if n_extrato > 0:
+        st.subheader("Saldo em conta (extrato XP)")
+        st.caption(
+            "Caixa disponível na conta investimento — **não** é o patrimônio total "
+            "investido (use a evolução patrimonial acima para isso)."
+        )
+        df_saldo = relatorios.saldo_conta_extrato(titular_id=titular_id)
+        if not df_saldo.empty and len(df_saldo) > 1:
+            fig_saldo = px.area(df_saldo, x="data", y="saldo")
+            fig_saldo.update_layout(
+                margin=dict(t=10, b=10, l=10, r=10),
+                yaxis_title="R$",
+                xaxis_title="Data",
+            )
+            fig_saldo.update_xaxes(tickformat="%d/%m/%Y")
+            fig_saldo.update_traces(
+                hovertemplate="%{x|%d/%m/%Y}<br>R$ %{y:,.2f}<extra></extra>"
+            )
+            st.plotly_chart(fig_saldo, use_container_width=True)
+
+        df_fluxo = relatorios.fluxo_mensal_extrato(titular_id=titular_id)
+        if not df_fluxo.empty:
+            st.subheader("Fluxos mensais (extrato XP)")
+            dff = df_fluxo.melt(
+                id_vars="mes", var_name="Tipo", value_name="Valor"
+            )
+            dff["Tipo"] = dff["Tipo"].map(
+                {
+                    "entradas": "Entradas (compras/aplicações)",
+                    "saidas": "Saídas (resgates)",
+                    "proventos": "Proventos (juros/cupons)",
+                }
+            )
+            fig_fluxo = px.bar(dff, x="mes", y="Valor", color="Tipo", barmode="group")
+            fig_fluxo.update_layout(
+                margin=dict(t=10, b=10, l=10, r=10),
+                yaxis_title="R$",
+                xaxis_title="Mês",
+            )
+            fig_fluxo.update_xaxes(tickformat="%m/%Y")
+            st.plotly_chart(fig_fluxo, use_container_width=True)
+
     st.subheader("Tabela analítica por ativo")
     linhas = []
     for a in cons.analises:
@@ -285,9 +384,11 @@ def aba_painel(titular_id: int | None) -> None:
             "Ativo": a.nome,
             "Titular": a.titular,
             "Categoria": a.categoria,
+            "Período CDI": analise.rotulo_periodo_cdi(a),
             "Aplicado": brl(a.valor_aplicado),
             "Posição": brl(a.valor_atual),
             "Rent. bruta": pct(a.rent_bruta),
+            "CDI acum.": pct(a.cdi_periodo) if a.cdi_periodo is not None else "—",
             "% do CDI": pct(a.pct_cdi) if a.pct_cdi is not None else "—",
             "Rent. real": pct(a.rent_real) if a.rent_real is not None else "—",
             "IR estimado*": brl(a.ir_estimado),
@@ -296,6 +397,12 @@ def aba_painel(titular_id: int | None) -> None:
             linha["Rent. bruta"] = f"{pct(a.rent_bruta)} (extrato)"
             if a.valor_economico is not None:
                 linha["Retorno total"] = brl(a.valor_economico)
+        elif (
+            a.data_snapshot
+            and a.data_fim_cdi
+            and a.data_snapshot < a.data_fim_cdi
+        ):
+            linha["Rent. bruta"] = f"{linha['Rent. bruta']} (pos. {data_br(a.data_snapshot)})"
         linhas.append(linha)
     st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
     st.caption("*IR estimado pela tabela regressiva (Lei 11.033/2004). O Informe de Rendimentos oficial prevalece.")
@@ -438,6 +545,8 @@ def aba_alertas(titular_id: int | None) -> None:
         with st.container(border=True):
             st.markdown(f"### {icone} {a.nome}")
             st.caption(f"{a.titular} · {a.categoria}")
+            if a.cdi_periodo is not None:
+                st.caption(f"Período CDI: **{analise.rotulo_periodo_cdi(a)}**")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Aplicado", brl(a.valor_aplicado))
             m2.metric("Atual", brl(a.valor_atual))
@@ -744,7 +853,9 @@ def aba_ativos(titular_id: int | None) -> None:
             "Categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
             "CNPJ": st.column_config.TextColumn("CNPJ"),
             "Data aplicação": st.column_config.DateColumn(
-                "Data aplicação", format="DD/MM/YYYY", help="Delimita o CDI do período."
+                "Data aplicação",
+                format="DD/MM/YYYY",
+                help="Início do período usado na comparação com CDI no Painel e Alertas.",
             ),
             "Aplicado": st.column_config.NumberColumn("Aplicado (R$)", format="%.2f"),
             "Isento IR": st.column_config.CheckboxColumn("Isento IR"),
@@ -1177,6 +1288,7 @@ def aba_importar() -> None:
             "Aguardando o envio. Dica: no app/site da XP, exporte a "
             "'Posição Detalhada' em Excel — é o formato mais completo."
         )
+        _secao_extrato_conta()
         return
 
     resolver = st.checkbox(
@@ -1380,6 +1492,327 @@ def aba_importar() -> None:
             f"{ignorados} ignorados. Total: {brl(round(total_gravado, 2))}."
         )
         st.session_state.pop("import_estado", None)
+
+    _secao_extrato_conta()
+
+
+def _secao_extrato_conta() -> None:
+    """Importação do Extrato da conta XP (histórico, datas e proventos)."""
+    st.divider()
+    st.subheader("📒 Extrato da conta investimento (XP)")
+    st.info(
+        "**Objetivo principal:** identificar a **data de entrada** de cada ativo "
+        "da carteira atual. Com `data_aplicacao` preenchida, o painel calcula "
+        "rentabilidade × CDI do período real (desde a aplicação até hoje). "
+        "Use a aba **Datas de início** abaixo; gráficos de saldo/fluxo são complementares."
+    )
+    st.caption(
+        "Exporte no app/site da XP o **Extrato da conta** em Excel (histórico de "
+        "movimentações em caixa)."
+    )
+
+    mapa = _mapa_titulares()
+    titulares_nomes = [n for n in mapa if n != "Consolidado"]
+
+    arq = st.file_uploader(
+        "Extrato da conta (.xlsx)",
+        type=["xlsx", "xls"],
+        key="upload_extrato_conta",
+    )
+    if arq is None:
+        n_grav = database.contar_extrato_conta()
+        if n_grav:
+            st.info(f"Já há {n_grav} movimentação(ões) do extrato da conta gravadas no banco.")
+        return
+
+    chave = f"{arq.name}:{arq.size}"
+    estado = st.session_state.get("extrato_conta_estado")
+    if estado is None or estado.get("chave") != chave:
+        try:
+            with st.spinner("Lendo o extrato da conta..."):
+                resultado = importador_extrato_conta_xp.importar(
+                    arq.getvalue(), nome_arquivo=arq.name
+                )
+        except importador_xp.ErroImportacaoXP as exc:
+            st.error(f"Não foi possível ler o extrato da conta: {exc}")
+            return
+        titulares_db = database.listar_titulares()
+        sugerido = importador_extrato_conta_xp.titular_sugerido(
+            resultado.metadados.titular,
+            [{"nome": t["nome"]} for t in titulares_db],
+        )
+        estado = {
+            "chave": chave,
+            "resultado": resultado,
+            "titular_sugerido": sugerido,
+        }
+        st.session_state["extrato_conta_estado"] = estado
+
+    resultado = estado["resultado"]
+    meta = resultado.metadados
+    titular_nome = st.selectbox(
+        "Titular",
+        titulares_nomes,
+        index=(
+            titulares_nomes.index(estado["titular_sugerido"])
+            if estado.get("titular_sugerido") in titulares_nomes
+            else 0
+        ),
+        key="extrato_conta_titular",
+    )
+    titular_id = mapa[titular_nome]
+    ativos_ativos = database.listar_ativos(titular_id=titular_id, apenas_ativos=True)
+    ativos = database.listar_ativos(titular_id=titular_id, apenas_ativos=False)
+
+    com_data = sum(1 for a in ativos_ativos if a["data_aplicacao"])
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Conta", meta.conta or "—")
+    c2.metric("Movimentações", str(len(resultado.linhas)))
+    c3.metric("Período real", f"{data_br(meta.periodo_real_de)} – {data_br(meta.periodo_real_ate)}")
+    c4.metric("Ativos ativos", str(len(ativos_ativos)))
+    c5.metric("Com data de entrada", f"{com_data}/{len(ativos_ativos)}")
+
+    if meta.periodo_de and meta.periodo_real_de and meta.periodo_real_de > meta.periodo_de:
+        st.warning(
+            f"O cabeçalho declara desde {data_br(meta.periodo_de)}, mas a primeira "
+            f"movimentação é {data_br(meta.periodo_real_de)}. Pode haver lacuna no "
+            "histórico exportado pela XP."
+        )
+
+    tab_datas, tab_prov, tab_hist = st.tabs(
+        ["Datas de início", "Proventos", "Gravar histórico"]
+    )
+
+    with tab_datas:
+        aplicacoes = resultado.primeira_aplicacao_por_ativo
+        propostas = importador_extrato_conta_xp.casar_aplicacoes_com_ativos(
+            aplicacoes, ativos_ativos
+        )
+        ids_casados = {p["id"] for p in propostas}
+        sem_match = [a for a in ativos_ativos if int(a["id"]) not in ids_casados]
+        st.caption(
+            f"{len(aplicacoes)} entrada(s) no extrato; "
+            f"{len(propostas)} casada(s) com ativos **ativos** da carteira; "
+            f"{len(sem_match)} ativo(s) ativo(s) sem correspondência automática."
+        )
+        if not ativos_ativos:
+            st.warning(
+                "Nenhum ativo ativo neste titular. Importe primeiro a Posição Detalhada."
+            )
+        elif not propostas:
+            st.warning(
+                "Nenhum ativo da carteira casou com o extrato. Verifique o titular "
+                "ou ajuste os nomes na aba Ativos."
+            )
+        else:
+            linhas = []
+            for p in propostas:
+                ja_tem = bool(p["data_atual"])
+                linhas.append(
+                    {
+                        "aplicar": not ja_tem or p["data_detectada"] < (p["data_atual"] or "9999"),
+                        "id": p["id"],
+                        "ativo": p["ativo"],
+                        "data_atual": p["data_atual"],
+                        "data_detectada": p["data_detectada"],
+                        "casou_com": p["origem"],
+                        "score": p["score"],
+                    }
+                )
+            dfm = pd.DataFrame(linhas)
+            dfm["data_atual"] = pd.to_datetime(dfm["data_atual"], errors="coerce")
+            dfm["data_detectada"] = pd.to_datetime(dfm["data_detectada"], errors="coerce")
+            editado = st.data_editor(
+                dfm,
+                key="editor_extrato_datas",
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "aplicar": st.column_config.CheckboxColumn("Aplicar"),
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "ativo": st.column_config.TextColumn("Ativo", disabled=True, width="large"),
+                    "data_atual": st.column_config.DateColumn(
+                        "Data atual", format="DD/MM/YYYY", disabled=True
+                    ),
+                    "data_detectada": st.column_config.DateColumn(
+                        "Data detectada", format="DD/MM/YYYY"
+                    ),
+                    "casou_com": st.column_config.TextColumn("Casou com (extrato)", disabled=True),
+                    "score": st.column_config.NumberColumn("Similaridade", format="%.2f", disabled=True),
+                },
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button(
+                    "💾 Aplicar datas selecionadas", type="primary", key="btn_extrato_datas"
+                ):
+                    n = 0
+                    for _, l in editado.iterrows():
+                        if not bool(l["aplicar"]):
+                            continue
+                        iso = _iso_de_celula(l["data_detectada"])
+                        if iso:
+                            database.atualizar_ativo(int(l["id"]), {"data_aplicacao": iso})
+                            n += 1
+                    st.cache_data.clear()
+                    st.success(
+                        f"{n} data(s) gravada(s). O painel passará a comparar rentabilidade "
+                        "× CDI desde cada data de entrada."
+                    )
+                    st.rerun()
+            with col_b:
+                if st.button(
+                    "⚡ Aplicar todas com score ≥ 0,75",
+                    key="btn_extrato_datas_auto",
+                ):
+                    n = 0
+                    for _, l in editado.iterrows():
+                        if float(l["score"]) < 0.75:
+                            continue
+                        iso = _iso_de_celula(l["data_detectada"])
+                        if iso:
+                            database.atualizar_ativo(int(l["id"]), {"data_aplicacao": iso})
+                            n += 1
+                    st.cache_data.clear()
+                    st.success(f"{n} data(s) aplicada(s) automaticamente (alta confiança).")
+                    st.rerun()
+
+        if sem_match:
+            st.markdown("**Ativos ativos sem match no extrato** (informe a data manualmente na aba Ativos):")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Ativo": a["nome"],
+                            "Data atual": data_br(a["data_aplicacao"]),
+                            "Categoria": a["categoria"],
+                        }
+                        for a in sem_match
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    with tab_prov:
+        proventos = resultado.proventos_propostos
+        props = importador_extrato_conta_xp.casar_proventos_com_ativos(proventos, ativos)
+        st.caption(
+            f"{len(proventos)} pagamento(s) de juros/cupom no extrato; "
+            f"{len(props)} casado(s) com a carteira."
+        )
+        if not props:
+            st.warning("Nenhum provento casou com ativos cadastrados.")
+        else:
+            linhas_p = []
+            for p in props:
+                ja = database.provento_existe(p["ativo_id"], p["data"], p["valor"])
+                linhas_p.append(
+                    {
+                        "importar": not ja,
+                        "ativo": p["ativo"],
+                        "data": p["data"],
+                        "valor": p["valor"],
+                        "tipo": p["tipo"],
+                        "origem": p["origem"],
+                        "score": p["score"],
+                        "status": "já existe" if ja else "novo",
+                    }
+                )
+            dfp = pd.DataFrame(linhas_p)
+            dfp["data"] = pd.to_datetime(dfp["data"], errors="coerce")
+            edit_p = st.data_editor(
+                dfp,
+                key="editor_extrato_prov",
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "importar": st.column_config.CheckboxColumn("Importar"),
+                    "ativo": st.column_config.TextColumn("Ativo", disabled=True),
+                    "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                    "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
+                    "tipo": st.column_config.TextColumn("Tipo", disabled=True),
+                    "origem": st.column_config.TextColumn("Lançamento", disabled=True, width="large"),
+                    "score": st.column_config.NumberColumn("Similaridade", format="%.2f", disabled=True),
+                    "status": st.column_config.TextColumn("Status", disabled=True),
+                },
+            )
+            if st.button("💾 Importar proventos selecionados", type="primary", key="btn_extrato_prov"):
+                n = 0
+                for _, l in edit_p.iterrows():
+                    if not bool(l["importar"]):
+                        continue
+                    ativo_row = next(
+                        (a for a in ativos if a["nome"] == l["ativo"]), None
+                    )
+                    if ativo_row is None:
+                        continue
+                    iso = _iso_de_celula(l["data"])
+                    if not iso:
+                        continue
+                    val = float(l["valor"])
+                    aid = int(ativo_row["id"])
+                    if database.provento_existe(aid, iso, val):
+                        continue
+                    database.registrar_provento(aid, iso, str(l["tipo"]), val)
+                    n += 1
+                st.success(f"{n} provento(s) importado(s).")
+                st.rerun()
+
+    with tab_hist:
+        st.caption(
+            "Opcional: grava o ledger completo para os gráficos de saldo/fluxo no painel. "
+            "Idempotente — reimportar não duplica. **Não altera** o valor aplicado dos ativos."
+        )
+        nome_para_id = {_norm_ativo(a["nome"]): int(a["id"]) for a in ativos}
+
+        if st.button("💾 Gravar histórico do extrato", type="primary", key="btn_extrato_hist"):
+            payload = []
+            for ln in resultado.linhas:
+                ativo_id = None
+                if ln.ativo_nome:
+                    chave_n = _norm_ativo(ln.ativo_nome)
+                    ativo_id = nome_para_id.get(chave_n)
+                    if ativo_id is None:
+                        for p in importador_extrato_conta_xp.casar_aplicacoes_com_ativos(
+                            [
+                                importador_extrato_conta_xp.AplicacaoExtrato(
+                                    ln.ativo_nome or "",
+                                    ln.data_mov,
+                                    1,
+                                    codigo=ln.codigo_ativo,
+                                )
+                            ],
+                            ativos,
+                            limiar=0.55,
+                        ):
+                            ativo_id = p["id"]
+                            break
+                payload.append(
+                    {
+                        "conta": meta.conta,
+                        "data_mov": ln.data_mov,
+                        "data_liq": ln.data_liq,
+                        "lancamento": ln.lancamento,
+                        "valor": ln.valor,
+                        "saldo": ln.saldo,
+                        "tipo": ln.tipo,
+                        "ativo_nome": ln.ativo_nome,
+                        "ativo_id": ativo_id,
+                        "import_hash": ln.import_hash(meta.conta),
+                    }
+                )
+            res = database.gravar_extrato_conta(titular_id, payload)
+            st.cache_data.clear()
+            st.success(
+                f"Histórico gravado: {res['inseridos']} nova(s), "
+                f"{res['ignorados']} já existente(s) (ignoradas)."
+            )
+            st.rerun()
+
+
+def _norm_ativo(n: str) -> str:
+    return importador_xp_planilha._norm(n).upper()
 
 
 # --------------------------------------------------------------------------- #

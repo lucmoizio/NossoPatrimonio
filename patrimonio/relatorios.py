@@ -45,6 +45,72 @@ def evolucao_patrimonial(titular_id: Optional[int] = None) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Extrato da conta XP (saldo em caixa e fluxos)
+# --------------------------------------------------------------------------- #
+def saldo_conta_extrato(titular_id: Optional[int] = None) -> pd.DataFrame:
+    """Série do saldo em conta investimento (último saldo por dia no ledger)."""
+    linhas = database.listar_extrato_conta(titular_id=titular_id)
+    rows = [
+        {"data": r["data_mov"], "saldo": r["saldo"]}
+        for r in linhas
+        if r["saldo"] is not None
+    ]
+    if not rows:
+        return pd.DataFrame(columns=["data", "saldo"])
+    df = pd.DataFrame(rows)
+    df["data"] = pd.to_datetime(df["data"])
+    return df.groupby("data", as_index=False)["saldo"].last().sort_values("data")
+
+
+def fluxo_mensal_extrato(titular_id: Optional[int] = None) -> pd.DataFrame:
+    """Entradas, saídas e proventos agregados por mês a partir do ledger."""
+    linhas = database.listar_extrato_conta(titular_id=titular_id)
+    if not linhas:
+        return pd.DataFrame(columns=["mes", "entradas", "saidas", "proventos"])
+
+    tipos_entrada = frozenset({"aplic_fundo", "compra"})
+    tipos_saida = frozenset({"resgate"})
+    buckets: dict[str, dict[str, float]] = {}
+    for r in linhas:
+        mes = str(r["data_mov"])[:7]
+        if mes not in buckets:
+            buckets[mes] = {"entradas": 0.0, "saidas": 0.0, "proventos": 0.0}
+        v = abs(float(r["valor"]))
+        tipo = r["tipo"]
+        if tipo in tipos_entrada:
+            buckets[mes]["entradas"] += v
+        elif tipo in tipos_saida:
+            buckets[mes]["saidas"] += v
+        elif tipo == "juros" and float(r["valor"]) > 0:
+            buckets[mes]["proventos"] += v
+
+    df = pd.DataFrame([{"mes": k, **v} for k, v in sorted(buckets.items())])
+    df["mes"] = pd.to_datetime(df["mes"] + "-01")
+    return df
+
+
+def timeline_ativo_extrato(ativo_id: int) -> pd.DataFrame:
+    """Movimentações do extrato vinculadas a um ativo."""
+    linhas = database.listar_extrato_conta(ativo_id=ativo_id)
+    if not linhas:
+        return pd.DataFrame(
+            columns=["data_mov", "tipo", "valor", "saldo", "lancamento"]
+        )
+    return pd.DataFrame(
+        [
+            {
+                "data_mov": r["data_mov"],
+                "tipo": r["tipo"],
+                "valor": r["valor"],
+                "saldo": r["saldo"],
+                "lancamento": r["lancamento"],
+            }
+            for r in linhas
+        ]
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Proventos (renda passiva)
 # --------------------------------------------------------------------------- #
 @dataclass

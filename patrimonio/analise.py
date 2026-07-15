@@ -80,7 +80,39 @@ class AnaliseAtivo:
     ganho_bruto: float
     rent_fonte: str = "posicao"              # 'posicao' | 'extrato'
     valor_economico: Optional[float] = None  # aplicado × (1+rent) quando extrato
+    data_aplicacao: Optional[str] = None     # início do período CDI (ISO)
+    data_fim_cdi: Optional[str] = None       # fim do período CDI (ISO, normalmente hoje)
+    dias_periodo: Optional[int] = None         # dias entre aplicação e fim CDI
     alertas: list[Alerta] = field(default_factory=list)
+
+
+def _data_br(iso: Optional[str]) -> str:
+    """ISO yyyy-mm-dd → dd/mm/aaaa para rótulos."""
+    if not iso:
+        return "—"
+    try:
+        return datetime.fromisoformat(str(iso)[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return str(iso)
+
+
+def rotulo_periodo_cdi(a: AnaliseAtivo) -> str:
+    """Rótulo legível do período usado na comparação com CDI."""
+    if not a.data_aplicacao or not a.data_fim_cdi:
+        return "—"
+    base = f"{_data_br(a.data_aplicacao)} → {_data_br(a.data_fim_cdi)}"
+    if a.dias_periodo is not None:
+        return f"{base} ({a.dias_periodo} dias)"
+    return base
+
+
+def _texto_periodo_cdi(a: AnaliseAtivo) -> str:
+    """Frase com datas para detalhes de alerta."""
+    if not a.data_aplicacao or not a.data_fim_cdi:
+        return "No período analisado"
+    return (
+        f"Desde {_data_br(a.data_aplicacao)} (aplicação) até {_data_br(a.data_fim_cdi)}"
+    )
 
 
 def _rent_bruta_extrato(ativo: Any) -> Optional[float]:
@@ -156,6 +188,7 @@ def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
         if ipca_periodo is not None
         else None
     )
+    dias_periodo = _dias_entre(data_aplic, hoje) if data_aplic else None
 
     # IR estimado (rotulado como estimativa na UI).
     isento = bool(ativo["isento_ir"])
@@ -185,6 +218,9 @@ def analisar_ativo(ativo: Any, hoje: Optional[str] = None) -> AnaliseAtivo:
         ganho_bruto=ganho_bruto,
         rent_fonte=rent_fonte,
         valor_economico=valor_economico,
+        data_aplicacao=data_aplic,
+        data_fim_cdi=hoje if data_aplic else None,
+        dias_periodo=dias_periodo,
     )
     analise.alertas = _gerar_alertas(ativo, analise, hoje)
     return analise
@@ -201,14 +237,15 @@ def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
             if a.rent_fonte == "extrato"
             else ""
         )
+        periodo_txt = _texto_periodo_cdi(a)
         if a.pct_cdi < LIMIAR_CDI_REVISAO:
             alertas.append(
                 Alerta(
                     "revisao",
                     f"Rende {a.pct_cdi:.0%} do CDI (< 70%) — revisar aplicação.",
                     detalhe=(
-                        f"Desde a aplicação o ativo rendeu {a.rent_bruta:.1%} (bruto{fonte_rent}), "
-                        f"enquanto o CDI do mesmo período acumulou {a.cdi_periodo:.1%}. "
+                        f"{periodo_txt}, o ativo rendeu {a.rent_bruta:.1%} (bruto{fonte_rent}), "
+                        f"enquanto o CDI acumulou {a.cdi_periodo:.1%}. "
                         f"Isso equivale a apenas {a.pct_cdi:.0%} do CDI — bem abaixo do "
                         "custo de oportunidade de um pós-fixado simples."
                     ),
@@ -225,9 +262,9 @@ def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
                     "atencao",
                     f"Rende {a.pct_cdi:.0%} do CDI (< 90%) — atenção.",
                     detalhe=(
-                        f"Rendimento bruto de {a.rent_bruta:.1%} contra {a.cdi_periodo:.1%} "
-                        f"de CDI no período ({a.pct_cdi:.0%} do CDI). Ainda aceitável, "
-                        "mas abaixo do ideal."
+                        f"{periodo_txt}, rendimento bruto de {a.rent_bruta:.1%} contra "
+                        f"{a.cdi_periodo:.1%} de CDI acumulado ({a.pct_cdi:.0%} do CDI). "
+                        "Ainda aceitável, mas abaixo do ideal."
                     ),
                     acao=(
                         f"Acompanhar. Sobre {montante}: se seguir abaixo de 90% do CDI "
@@ -237,13 +274,14 @@ def _gerar_alertas(ativo: Any, a: AnaliseAtivo, hoje: str) -> list[Alerta]:
             )
 
     if a.rent_real is not None and a.rent_real < 0:
+        periodo_txt = _texto_periodo_cdi(a)
         alertas.append(
             Alerta(
                 "atencao",
                 "Rentabilidade real negativa (perde para a inflação).",
                 detalhe=(
-                    f"Descontada a inflação do período ({a.ipca_periodo:.1%} de IPCA), a "
-                    f"rentabilidade real é {a.rent_real:.1%}. O poder de compra de "
+                    f"{periodo_txt}, descontada a inflação ({a.ipca_periodo:.1%} de IPCA), "
+                    f"a rentabilidade real é {a.rent_real:.1%}. O poder de compra de "
                     f"{montante} está sendo corroído."
                 ),
                 acao=(

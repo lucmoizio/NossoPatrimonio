@@ -83,6 +83,7 @@ robo-patrimonio/
     ├── analise.py    # motor de análise por ativo + consolidação + alertas
     ├── projecao.py   # juros compostos, cenários, anos-até-meta
     ├── relatorios.py # evolução patrimonial, proventos, relatório IR
+    ├── importador_extrato_conta_xp.py  # Extrato da conta XP (ledger histórico)
     ├── consultor.py  # Consultor IA (Anthropic API + web search)
     └── simulador.py  # paper trading B3 com travas
 ```
@@ -169,19 +170,37 @@ então essa reconstrução é uma rotina de lote (botão na aba ou `atualizar.py
 pytest
 ```
 
-Cobrem os parsers (extrato de movimentações, helpers da planilha e do Informe
-Diário) e a lógica de comparação/recomendação — todos sem rede (fixtures
-sintéticas).
+Cobrem os parsers (extrato da conta, extrato de movimentações, helpers da planilha
+e do Informe Diário) e a lógica de comparação/recomendação — todos sem rede
+(fixtures sintéticas).
 
 **Reset da plataforma:** ao adicionar nova persistência ligada à carteira ou ao
-motor de fundos, inclua a tabela em `_TABELAS_ZERAR_*` em `database.py` e, se
-houver cache em arquivo, limpe-o em `app.py` (`_sidebar_zerar_dados`). O
-cadastro oficial `fundos_cadastro` (referência CVM) é preservado de propósito.
+motor de fundos, inclua a tabela em `_TABELAS_ZERAR_*` em `database.py` (hoje
+inclui `extrato_conta`, `proventos`, `movimentos`, `snapshots`, `ativos` e o
+cache do motor) e, se houver cache em arquivo ou `session_state`, limpe-o em
+`app.py` (`_sidebar_zerar_dados`). O cadastro oficial `fundos_cadastro`
+(referência CVM) é preservado de propósito.
 
 **Rentabilidade do extrato XP:** a coluna *Rentabilidade* da Posição Detalhada
 é gravada em `rent_bruta_extrato` e usada na análise quando presente (retorno
 total, incluindo cupons fora da posição — essencial para COE/RF com cupom).
 Reimporte o extrato para atualizar ativos já cadastrados.
+
+## Três exports da XP (o que cada um faz no app)
+
+| Export XP | O que traz | Uso no sistema |
+|---|---|---|
+| **Posição Detalhada** (XLSX/CSV) | Snapshot da carteira: saldo, valor aplicado, rentabilidade | Aba **Importar extrato** — cadastra/atualiza ativos e snapshots |
+| **Extrato da conta** (XLSX) | Histórico de movimentações em caixa: compras, TEDs em fundos, resgates, cupons/juros, saldo em conta | Mesma aba, seção inferior — datas de 1ª aplicação, proventos históricos, gráficos de fluxo e saldo em conta no painel |
+| **Extrato de movimentações** (XLSX/CSV/PDF) | Layout variável; parser heurístico | Aba **Ativos** (expander) — fallback para datas quando o Extrato da conta não estiver disponível |
+
+Limitações do **Extrato da conta**:
+- O saldo em conta é **caixa disponível**, não patrimônio total investido (para isso use snapshots da Posição Detalhada).
+- O período exportado pode ter lacunas (ex.: cabeçalho desde 2020, mas movimentos só a partir de 2022).
+- Nomes de fundos em TEDs podem vir truncados — o app casa por similaridade e pede conferência antes de gravar.
+- O ledger fica em `extrato_conta` e **não altera** `valor_aplicado` (evita duplicar o custo da Posição Detalhada).
+
+Arquivos pessoais exportados da XP devem ficar em `exports_investimentos/` (pasta no `.gitignore`).
 
 ## Princípios inegociáveis
 

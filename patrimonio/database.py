@@ -197,6 +197,25 @@ def inicializar(caminho: Optional[Path] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_proventos_ativo ON proventos(ativo_id);
             CREATE INDEX IF NOT EXISTS idx_cotas_fundos_cnpj ON cotas_fundos(cnpj);
             CREATE INDEX IF NOT EXISTS idx_universo_classe ON universo_retornos(cnpj);
+
+            -- Ledger do Extrato da conta XP (histórico de movimentações em caixa).
+            -- Separado de movimentos para não alterar valor_aplicado da Posição Detalhada.
+            CREATE TABLE IF NOT EXISTS extrato_conta (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                titular_id   INTEGER NOT NULL REFERENCES titulares(id),
+                conta        TEXT,
+                data_mov     TEXT NOT NULL,
+                data_liq     TEXT,
+                lancamento   TEXT NOT NULL,
+                valor        REAL NOT NULL,
+                saldo        REAL,
+                tipo         TEXT NOT NULL,
+                ativo_nome   TEXT,
+                ativo_id     INTEGER REFERENCES ativos(id),
+                import_hash  TEXT NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS idx_extrato_conta_titular ON extrato_conta(titular_id);
+            CREATE INDEX IF NOT EXISTS idx_extrato_conta_ativo ON extrato_conta(ativo_id);
             """
         )
 
@@ -240,7 +259,13 @@ def id_titular(nome: str, caminho: Optional[Path] = None) -> Optional[int]:
 # carteira ou ao motor de fundos, inclua a tabela aqui — senão o reset fica incompleto.
 # `fundos_cadastro` fica de fora: é cadastro oficial da CVM (referência), não dado
 # do usuário; rebaixá-lo forçaria re-sync pesado sem benefício para reimportar.
-_TABELAS_ZERAR_CARTEIRA = ("proventos", "movimentos", "snapshots", "ativos")
+_TABELAS_ZERAR_CARTEIRA = (
+    "extrato_conta",
+    "proventos",
+    "movimentos",
+    "snapshots",
+    "ativos",
+)
 _TABELAS_ZERAR_MOTOR = ("cotas_fundos", "universo_retornos", "pares_classe")
 _TABELAS_ZERAR_METAS = ("metas",)
 _TABELAS_ZERAR_SIMULADOR = ("sim_ordens", "sim_config")
@@ -254,10 +279,11 @@ def zerar_dados(
 ) -> dict[str, int]:
     """Apaga os dados do usuário e retorna quantas linhas foram removidas.
 
-    Sempre limpa carteira (ativos, snapshots, movimentos, proventos) e o cache
-    do motor de fundos (cotas sincronizadas, universo de pares). Metas e
-    simulador são opcionais. Os titulares fixos são preservados (e regarantidos).
-    Operação irreversível — a UI exige confirmação explícita.
+    Sempre limpa carteira (ledger do extrato da conta, proventos, movimentos,
+    snapshots, ativos) e o cache do motor de fundos (cotas sincronizadas,
+    universo de pares). Metas e simulador são opcionais. Os titulares fixos
+    são preservados (e regarantidos). Operação irreversível — a UI exige
+    confirmação explícita.
     """
     tabelas = list(_TABELAS_ZERAR_CARTEIRA) + list(_TABELAS_ZERAR_MOTOR)
     if incluir_metas:
@@ -539,6 +565,134 @@ def listar_proventos(
 def remover_provento(provento_id: int, caminho: Optional[Path] = None) -> None:
     with transacao(caminho) as con:
         con.execute("DELETE FROM proventos WHERE id = ?", (provento_id,))
+
+
+def provento_existe(
+    ativo_id: int,
+    data_ref: str,
+    valor: float,
+    *,
+    tolerancia: float = 0.02,
+    caminho: Optional[Path] = None,
+) -> bool:
+    """True se já há provento com mesma data e valor próximo para o ativo."""
+    with transacao(caminho) as con:
+        linha = con.execute(
+            """
+            SELECT 1 FROM proventos
+            WHERE ativo_id = ? AND data = ? AND ABS(valor - ?) <= ?
+            LIMIT 1
+            """,
+            (ativo_id, data_ref, valor, tolerancia),
+        ).fetchone()
+        return linha is not None
+
+
+# --------------------------------------------------------------------------- #
+# Extrato da conta XP (ledger histórico)
+# --------------------------------------------------------------------------- #
+def gravar_extrato_conta(
+    titular_id: int,
+    linhas: list[dict[str, Any]],
+    caminho: Optional[Path] = None,
+) -> dict[str, int]:
+    """Grava linhas do extrato da conta (idempotente por import_hash).
+
+    Cada item de `linhas` deve ter: conta, data_mov, data_liq, lancamento, valor,
+    saldo, tipo, ativo_nome, ativo_id (opcional), import_hash.
+    Retorna {inseridos, ignorados}.
+    """
+    inseridos = 0
+    ignorados = 0
+    with transacao(caminho) as con:
+        for ln in linhas:
+            try:
+                con.execute(
+                    """
+                    INSERT INTO extrato_conta (
+                        titular_id, conta, data_mov, data_liq, lancamento,
+                        valor, saldo, tipo, ativo_nome, ativo_id, import_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        titular_id,
+                        ln.get("conta"),
+                        ln["data_mov"],
+                        ln.get("data_liq"),
+                        ln["lancamento"],
+                        ln["valor"],
+                        ln.get("saldo"),
+                        ln["tipo"],
+                        ln.get("ativo_nome"),
+                        ln.get("ativo_id"),
+                        ln["import_hash"],
+                    ),
+                )
+                inseridos += 1
+            except sqlite3.IntegrityError:
+                ignorados += 1
+    return {"inseridos": inseridos, "ignorados": ignorados}
+
+
+def listar_extrato_conta(
+    titular_id: Optional[int] = None,
+    ativo_id: Optional[int] = None,
+    caminho: Optional[Path] = None,
+) -> list[sqlite3.Row]:
+    """Lista movimentações do ledger do extrato da conta."""
+    where: list[str] = []
+    params: list[Any] = []
+    if titular_id is not None:
+        where.append("titular_id = ?")
+        params.append(titular_id)
+    if ativo_id is not None:
+        where.append("ativo_id = ?")
+        params.append(ativo_id)
+    clausula = f"WHERE {' AND '.join(where)}" if where else ""
+    with transacao(caminho) as con:
+        return con.execute(
+            f"""
+            SELECT id, titular_id, conta, data_mov, data_liq, lancamento,
+                   valor, saldo, tipo, ativo_nome, ativo_id, import_hash
+            FROM extrato_conta
+            {clausula}
+            ORDER BY data_mov, id
+            """,
+            params,
+        ).fetchall()
+
+
+def contar_extrato_conta(
+    titular_id: Optional[int] = None, caminho: Optional[Path] = None
+) -> int:
+    with transacao(caminho) as con:
+        if titular_id is None:
+            return int(con.execute("SELECT COUNT(*) AS c FROM extrato_conta").fetchone()["c"])
+        return int(
+            con.execute(
+                "SELECT COUNT(*) AS c FROM extrato_conta WHERE titular_id = ?",
+                (titular_id,),
+            ).fetchone()["c"]
+        )
+
+
+def vincular_extrato_ativos(
+    titular_id: int,
+    mapeamento: dict[int, int],
+    caminho: Optional[Path] = None,
+) -> int:
+    """Atualiza ativo_id nas linhas do extrato (por id da linha). Retorna quantas."""
+    if not mapeamento:
+        return 0
+    n = 0
+    with transacao(caminho) as con:
+        for linha_id, ativo_id in mapeamento.items():
+            con.execute(
+                "UPDATE extrato_conta SET ativo_id = ? WHERE id = ? AND titular_id = ?",
+                (ativo_id, linha_id, titular_id),
+            )
+            n += 1
+    return n
 
 
 # --------------------------------------------------------------------------- #

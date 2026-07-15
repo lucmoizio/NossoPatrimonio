@@ -11,6 +11,9 @@ patrimonio.db-shm
 # Log do motor de atualização
 atualizar.log
 
+# Exports pessoais da XP (extratos, posições)
+exports_investimentos/
+
 # Python
 __pycache__/
 *.py[cod]

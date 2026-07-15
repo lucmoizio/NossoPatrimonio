@@ -33,8 +33,41 @@ def test_coe_usa_rent_bruta_extrato_nao_posicao(_ipca, _cdi, banco_temporario):
     assert a.pct_cdi is not None
     assert a.pct_cdi > 0.90
     assert a.pct_cdi < 1.0
+    assert a.data_aplicacao == "2024-04-11"
+    assert a.data_fim_cdi == "2026-07-12"
+    assert a.dias_periodo == _dias("2024-04-11", "2026-07-12")
+    assert "11/04/2024" in analise.rotulo_periodo_cdi(a)
     niveis = [al.nivel for al in a.alertas]
     assert "revisao" not in niveis
+
+
+def _dias(inicio: str, fim: str) -> int:
+    from datetime import datetime
+
+    d0 = datetime.fromisoformat(inicio).date()
+    d1 = datetime.fromisoformat(fim).date()
+    return (d1 - d0).days
+
+
+def test_rotulo_periodo_cdi_sem_data():
+    a = analise.AnaliseAtivo(
+        ativo_id=0,
+        nome="X",
+        titular="T",
+        categoria="Fundo",
+        valor_aplicado=100.0,
+        valor_atual=100.0,
+        data_snapshot=None,
+        rent_bruta=0.0,
+        cdi_periodo=None,
+        ipca_periodo=None,
+        pct_cdi=None,
+        rent_real=None,
+        ir_estimado=0.0,
+        aliquota_ir_pct=0.0,
+        ganho_bruto=0.0,
+    )
+    assert analise.rotulo_periodo_cdi(a) == "—"
 
 
 @patch("patrimonio.analise.mercado.cdi_acumulado", return_value=0.320348)
@@ -50,5 +83,14 @@ def test_sem_extrato_usa_posicao(_cdi, banco_temporario):
 
     assert a.rent_fonte == "posicao"
     assert abs(a.rent_bruta - (7910 / 7500 - 1)) < 0.0001
+    assert a.data_aplicacao == "2024-04-11"
+    assert a.data_fim_cdi == "2026-07-12"
     assert a.pct_cdi is not None
     assert a.pct_cdi < 0.20
+    alerta_cdi = next(
+        (al for al in a.alertas if "CDI" in al.mensagem and al.nivel == "revisao"),
+        None,
+    )
+    assert alerta_cdi is not None
+    assert "11/04/2024" in alerta_cdi.detalhe
+    assert "12/07/2026" in alerta_cdi.detalhe
